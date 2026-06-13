@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "UserActivityEvent",
+  "namespace": "com.example.flink.model.avro",
+  "doc": "Kafka user-activity-events 토픽의 사용자 행동 이벤트 (Avro SpecificRecord codegen source).",
+  "fields": [
+    {"name": "eventId",   "type": "string", "doc": "이벤트 고유 ID"},
+    {"name": "userId",    "type": "string", "doc": "사용자 ID"},
+    {"name": "pageId",    "type": "string", "doc": "페이지 ID (keyBy 키)"},
+    {"name": "eventType", "type": "string", "doc": "이벤트 타입 (예: CLICK, VIEW)"},
+    {"name": "eventTime", "type": "long",   "doc": "이벤트 발생 시각, epoch milliseconds (Event Time)"},
+    {"name": "sessionId", "type": ["null", "string"], "default": null, "doc": "세션 ID (nullable)"}
+  ]
+}

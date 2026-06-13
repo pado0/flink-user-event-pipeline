@@ -1,0 +1,14 @@
+# Maven build output (Avro codegen은 빌드 산출물이므로 커밋하지 않음)
+target/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+
+# Logs
+*.log
