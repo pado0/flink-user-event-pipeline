@@ -221,8 +221,8 @@ CLAUDE.md `K1`: **`PageClickCount` → OpenSearch 문서(JSON) 매핑 + determin
   - `03ea38b` `feat: S3 Avro 샘플 이벤트 producer 적재`
   - `7339e36` `feat: S4 KafkaSource + Confluent Avro registry deser → print()`
   - `d4ea7af` `feat: S5 Event Time / Watermark 부여 + handoff 문서 갱신`
-- ⚠️ 현재 로컬이 `origin/main`보다 **앞서 있음**(S3·S4·S5 미푸시). push는 사용자 요청 시.
-- **P1·P2·P3 작업은 미커밋**(작업트리): `model/PageClickCount.java`, `agg/PageClickCountAggregator.java`, `agg/PageClickWindowResultFunction.java`(신규) + `job/FlinkUserActivityAnalyticsJob.java`(probe 제거, filter→keyBy→window 연결) + `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상.
+  - `6258919` `feat: P1·P2·P3 filter-click → keyBy(pageId) → 5min tumbling window`
+- **`origin/main`과 동기화 완료** (HEAD = `6258919`, 작업트리 clean). S1~P3 전부 푸시됨.
 
 ## 8. 참고
 
