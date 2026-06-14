@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-14** (`W1` 로컬 MiniCluster Flink Web UI 활성화 완료 — `flink-runtime-web` 추가 + `createLocalEnvironmentWithWebUI(8082)`, 실행 중 REST/UI 노출 검증) / 기준 커밋: `d162d31` + W1 미커밋 변경(`pom.xml`·`job`·`CLAUDE.md`·이 문서)
+> 최종 갱신: **2026-06-14** (`W1` 로컬 MiniCluster Flink Web UI 활성화 완료 — `flink-runtime-web` 추가 + `createLocalEnvironmentWithWebUI(8082)`, 실행 중 REST/UI 노출 검증) / 기준 커밋: `d49237b`(W1 커밋·푸시 완료, 이 문서 정정 커밋이 HEAD)
 
 ---
 
@@ -314,9 +314,11 @@ CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
   - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정`
   - `103d7ab` `feat: K1·K2·K3 OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등)`
   - `0f8aeef` `docs: HANDOFF Git 섹션을 103d7ab(K1·K2·K3) 커밋·푸시 반영으로 정정`
-  - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가` ← 현재 HEAD(`origin/main`)
-- **`origin/main`과 동기화 완료** (HEAD = `d162d31`). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. `d162d31` 변경: `CLAUDE.md`/`docs/HANDOFF.md`에 W1 Web UI 스텝 추가 — 문서만, 코드 미변경.)
-- ⚠️ **W1 구현은 아직 미커밋**(작업트리 변경 있음). 변경 파일: `pom.xml`(flink-runtime-web provided 추가), `job/FlinkUserActivityAnalyticsJob.java`(`createLocalEnvironmentWithWebUI`+`RestOptions.PORT 8082`+`WEB_UI_PORT` env), `CLAUDE.md`(W1 체크 ✅), `docs/HANDOFF.md`(이 문서). 커밋 메시지 예: `feat: W1 로컬 MiniCluster Flink Web UI(8082) 활성화`.
+  - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가`
+  - `83dec7d` `docs: HANDOFF Git 섹션에 0f8aeef·d162d31 커밋 이력 반영`
+  - `d49237b` `feat: W1 로컬 MiniCluster Flink Web UI(8082) 활성화`
+  - `<이 커밋>` `docs: HANDOFF Git 섹션을 d49237b(W1) 반영으로 정정` ← 현재 HEAD(`origin/main`)
+- **`origin/main`과 동기화 완료**. S1~K3 + **W1 전부 푸시됨**. (`d49237b` 변경: `pom.xml`에 `flink-runtime-web:1.18.1`(provided) 추가, `job/FlinkUserActivityAnalyticsJob.java` env를 `createLocalEnvironmentWithWebUI`+`RestOptions.PORT 8082`+`WEB_UI_PORT` env로 교체, `CLAUDE.md` W1 체크 ✅, `docs/HANDOFF.md` 갱신. 코드는 `pom.xml`·`job` 2파일만, DAG 로직 불변.)
 
 ## 8. 참고
 
