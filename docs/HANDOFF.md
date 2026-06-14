@@ -276,8 +276,9 @@ CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
   - `7339e36` `feat: S4 KafkaSource + Confluent Avro registry deser → print()`
   - `d4ea7af` `feat: S5 Event Time / Watermark 부여 + handoff 문서 갱신`
   - `6258919` `feat: P1·P2·P3 filter-click → keyBy(pageId) → 5min tumbling window`
-  - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정` ← 현재 HEAD(푸시됨)
-- **K1·K2·K3는 아직 미커밋**(작업트리). 변경: `pom.xml`(opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind), `job/FlinkUserActivityAnalyticsJob.java`(sink 연결), 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. 커밋 메시지(안): `feat: K1·K2·K3 OpenSearch sink(JSON 문서 + deterministic id + bulk/retry + 멱등)`.
+  - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정`
+  - `103d7ab` `feat: K1·K2·K3 OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등)` ← 현재 HEAD
+- **`origin/main`과 동기화 완료** (HEAD = `103d7ab`, 작업트리 clean). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신.)
 
 ## 8. 참고
 
