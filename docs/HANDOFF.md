@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-13** (S4 완료) / 기준 커밋: `03ea38b` (S3) (+ S4 미커밋 작업트리)
+> 최종 갱신: **2026-06-13** (S5 완료) / 기준 커밋: `03ea38b` (S3) (+ S4·S5 미커밋 작업트리)
 
 ---
 
@@ -18,8 +18,9 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S2** | docker-compose 기동(Kafka+SR+OpenSearch+Dashboards) + 토픽 생성 | ✅ 완료 |
 | **S3** | Avro producer로 샘플 이벤트 적재 | ✅ 완료 |
 | **S4** | KafkaSource + Confluent Avro deser → `print()` | ✅ 완료 |
-| **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ⬜ **다음 차례** |
-| P1~ | Filter / keyBy / Window / Sink / Checkpoint | ⬜ |
+| **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ✅ 완료 |
+| **P1** | `eventType == CLICK` 필터 `[filter-click]` | ⬜ **다음 차례** |
+| P2~ | keyBy / Window / Sink / Checkpoint | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
 > **작업 규칙(중요):** 사용자는 **한 스텝씩만** 구현하고 멈추길 원함. 검증 게이트 통과 후 다음 진행. 임의로 다음 스텝 선행 금지.
@@ -43,7 +44,7 @@ filnk-practice/
         ├── source/
         │   └── UserActivityKafkaSourceFactory.java # S4: KafkaSource + Confluent Avro registry deser
         └── job/
-            └── FlinkUserActivityAnalyticsJob.java  # S4: DAG 조립(현재 source→print)
+            └── FlinkUserActivityAnalyticsJob.java  # S5: DAG 조립(현재 source→assign-watermark→probe→print)
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -82,6 +83,13 @@ filnk-practice/
   - env override: `BOOTSTRAP_SERVERS` / `SCHEMA_REGISTRY_URL` / `KAFKA_GROUP_ID` / `BOUNDED`.
 - `pom.xml`: `flink-streaming-java`·`flink-clients`·`flink-connector-base`(**provided**), `flink-connector-kafka:3.1.0-1.18`·`flink-avro`·`flink-avro-confluent-registry`(**compile**, 이후 shade 대상).
   - ⚠️ **실행 함정(해결됨)**: Flink는 provided라 (1) `exec`는 `classpathScope=compile`로 provided까지 포함해야 하고, (2) `flink-connector-kafka`의 provided 전이의존이 누락되어 `flink-connector-base`를 명시 추가했으며, (3) `exec:java`(동일 JVM)는 MiniCluster classloader 문제로 `ExecutionConfig ClassNotFound`가 나므로 **Flink Job은 `exec:exec`(forked JVM)** 로 실행한다. → producer=`exec:java`, job=`exec:exec@job`.
+
+### S5 — Event Time / Watermark 부여
+- `job/FlinkUserActivityAnalyticsJob.java`만 수정(다른 파일·pom 변경 없음). DAG: `source-user-activity-events → assign-watermark → watermark-probe → print-events`.
+  - source 뒤에 `assignTimestampsAndWatermarks(...)` operator를 **분리**(name/uid=`assign-watermark`) — CLAUDE.md DAG가 `[assign-watermark]`를 별도 노드로 두므로. source의 `fromSource(...)`에는 계속 `WatermarkStrategy.noWatermarks()`.
+  - 전략: `forBoundedOutOfOrderness(Duration.ofSeconds(30)).withTimestampAssigner((e,ts) -> e.getEventTime())` — 가드레일대로 Event Time = Avro `eventTime`(epoch ms).
+  - 검증용 `WatermarkProbe`(name/uid=`watermark-probe`): non-keyed `ProcessFunction<UserActivityEvent,String>`, 상태 없는 pass-through 진단기. 각 레코드의 `ctx.timestamp()`(부여된 event-time)·`ctx.timerService().currentWatermark()`·pageId/eventType를 한 줄 출력 → `print()`. S4의 `.print()` 자리를 대체하는 임시 스캐폴딩(P3 window가 붙으면 제거 예정).
+  - ⚠️ event-time **타이머는 keyed stream에서만** 가능 → keyBy(P2) 전이라 probe에서 타이머로 watermark firing은 검증 불가. 실제 firing 검증은 P3 window에서.
 
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
@@ -136,27 +144,23 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | Schema Registry (S3 후) | `curl -s localhost:8081/subjects` | `["user-activity-events-value"]` (S3 적재로 등록됨) |
 | 토픽 메시지 (S3 후) | `kafka.tools.GetOffsetShell ... --topic user-activity-events` | offset 합 = 적재 건수 (예: 60) |
 | Flink S4 read | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `UserActivityEvent` JSON이 적재 건수만큼 stdout 출력 |
+| Flink S5 watermark | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `[probe]` 라인마다 **recordTs == eventTime** (timestamp assigner 동작) |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
 > S3 실측: 60건 적재 → subject `user-activity-events-value`(version 1, id 1) 등록, 파티션 분포 p0=0 / p1=35 / p2=25 (key=pageId 해시로 5개 키가 2개 파티션에 분산), avro-console-consumer로 CLICK/VIEW·sessionId(null 포함) 정상 디코드.
 >
 > S4 실측: `BOUNDED=true` 실행으로 60건이 SpecificRecord로 역직렬화되어 print 출력(`9>`/`10>` prefix=source 병렬도), eventType 47 CLICK/13 VIEW, sessionId null·값 모두 정상. exit 0.
+>
+> S5 실측: `BOUNDED=true` 실행 → exit 0, probe 60건, **recordTs == eventTime 60/60 일치**(awk 파싱 확인). watermark는 bounded/버스트 입력이라 초기 레코드 전부 `MIN(uninitialized)`로 표시 — 주기적(기본 200ms) watermark 방출 전에 60건이 한 번에 통과하고 end-of-input에서 final MAX가 방출되기 때문(정상). watermark가 실제로 "진행"하는 모습은 P3 window/타이머에서 확인 예정.
 
-## 5. 다음 할 일 — S5
+## 5. 다음 할 일 — P1
 
-CLAUDE.md `S5`: **Event Time / Watermark 부여 `[assign-watermark]` (30s out-of-orderness).**
-- 현재 `fromSource(...)`에 `WatermarkStrategy.noWatermarks()`를 넘기고 있음 → 이를 교체.
-  ```java
-  WatermarkStrategy
-    .<UserActivityEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
-    .withTimestampAssigner((e, ts) -> e.getEventTime());
-  ```
-- 적용 위치 선택지: (a) `env.fromSource(source, <위 strategy>, "source-...")`에 직접, 또는
-  (b) source 뒤 `.assignTimestampsAndWatermarks(...)` operator로 분리(`[assign-watermark]` 라벨/uid 부여).
-  → DAG 라벨이 `assign-watermark`로 따로 있으니 (b)가 가드레일 네이밍과 맞음.
-- 검증 게이트(예상): watermark가 실제로 진행되는지(예: 간단한 timestamp 출력/이후 window에서 확인).
-- ⚠️ **사용자 요청 전까지 선행 구현 금지.** (한 스텝씩)
+CLAUDE.md `P1`: **`eventType == CLICK` 필터 `[filter-click]`.**
+- 현재 DAG 끝은 `assign-watermark → watermark-probe → print-events`. watermark까지 부여된 스트림(`timestamped`)에 `.filter(e -> "CLICK".equals(e.getEventType()))` operator를 추가(name/uid=`filter-click`).
+- 적용 위치: `assign-watermark` operator 결과(`timestamped`) **뒤**. 검증용 probe/print는 필터 뒤로 옮기거나 유지하며 CLICK만 남는지 확인.
+- 검증 게이트(예상): 필터 후 VIEW 이벤트가 사라지고 CLICK만 남는지(예: probe 출력 eventType 전부 CLICK, 건수 = 적재 중 CLICK 수).
+- ⚠️ **사용자 요청 전까지 선행 구현 금지.** (한 스텝씩 — keyBy(P2)/window(P3)는 P1 검증 후에)
 
 ## 6. 환경 제약 (Apple Silicon + colima) — 반드시 숙지
 
@@ -173,7 +177,7 @@ CLAUDE.md `S5`: **Event Time / Watermark 부여 `[assign-watermark]` (30s out-of
 - 원격: `git@github.com:pado0/flink-user-event-pipeline.git` (SSH), `origin/main` 추적 설정 완료.
 - 커밋 `672140f` `chore: 프로젝트 스캐폴딩 (S1 Avro 스키마 + S2 로컬 인프라)` 푸시 완료.
 - 커밋 `03ea38b` `feat: S3 Avro 샘플 이벤트 producer 적재` — **로컬 커밋만, 미푸시**.
-- **S4 작업은 아직 미커밋** (작업트리): `pom.xml`(Flink 의존성·exec job 실행), `src/.../source/UserActivityKafkaSourceFactory.java`, `src/.../job/FlinkUserActivityAnalyticsJob.java`, `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상.
+- **S4·S5 작업은 아직 미커밋** (작업트리): `pom.xml`(Flink 의존성·exec job 실행, S4), `src/.../source/UserActivityKafkaSourceFactory.java`(S4), `src/.../job/FlinkUserActivityAnalyticsJob.java`(S4 source→print + **S5 assign-watermark·watermark-probe**), `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상(S4·S5 분리 커밋 권장).
 
 ## 8. 참고
 
