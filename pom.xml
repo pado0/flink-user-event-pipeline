@@ -10,22 +10,45 @@
   <packaging>jar</packaging>
 
   <!--
-    S1 단계: Avro .avsc → UserActivityEvent(SpecificRecord) codegen 만을 위한 최소 구성.
-    Flink / Kafka / OpenSearch / Jackson 의존성과 maven-shade-plugin(fat-jar)은
-    이후 스텝(S2~)에서 추가한다.
+    S1: Avro .avsc → UserActivityEvent(SpecificRecord) codegen.
+    S3: 샘플 이벤트 적재용 Kafka producer + Confluent KafkaAvroSerializer(Schema Registry 연동).
+    Flink / OpenSearch 런타임 의존성과 maven-shade-plugin(fat-jar)은 이후 스텝(S4~)에서 추가한다.
   -->
 
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <avro.version>1.11.3</avro.version>
+    <!-- docker-compose의 cp-kafka / cp-schema-registry 7.6.1 (Apache Kafka 3.6.1)에 맞춤 -->
+    <kafka.version>3.6.1</kafka.version>
+    <confluent.version>7.6.1</confluent.version>
   </properties>
+
+  <!-- Confluent KafkaAvroSerializer / schema-registry-client 해석용 레포 -->
+  <repositories>
+    <repository>
+      <id>confluent</id>
+      <url>https://packages.confluent.io/maven/</url>
+    </repository>
+  </repositories>
 
   <dependencies>
     <dependency>
       <groupId>org.apache.avro</groupId>
       <artifactId>avro</artifactId>
       <version>${avro.version}</version>
+    </dependency>
+
+    <!-- S3 producer: Kafka client + Avro/Schema Registry 직렬화 (이후 Flink job 코드와는 무관) -->
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-clients</artifactId>
+      <version>${kafka.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.confluent</groupId>
+      <artifactId>kafka-avro-serializer</artifactId>
+      <version>${confluent.version}</version>
     </dependency>
   </dependencies>
 
@@ -51,6 +74,16 @@
             </configuration>
           </execution>
         </executions>
+      </plugin>
+
+      <!-- S3: 샘플 이벤트 producer 실행용 (mvn -q compile exec:java [-Dexec.args=200]) -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.1</version>
+        <configuration>
+          <mainClass>com.example.flink.producer.SampleEventProducer</mainClass>
+        </configuration>
       </plugin>
     </plugins>
   </build>
