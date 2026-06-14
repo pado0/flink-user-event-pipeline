@@ -156,9 +156,9 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `S5` Event Time / Watermark 부여(30s out-of-orderness) `[assign-watermark]` *(검증: probe로 부여된 event-time timestamp == eventTime 확인)*
 
 ### 1차 — Process
-- [ ] `P1` `eventType == CLICK` 필터 `[filter-click]`
-- [ ] `P2` `keyBy(pageId)`
-- [ ] `P3` 5분 Tumbling Window + `AggregateFunction`(count) + `WindowFunction`(windowStart/End 부착) → `PageClickCount` `[window-pageclick-5m]` *(검증: print로 window별 count)*
+- [x] `P1` `eventType == CLICK` 필터 `[filter-click]`
+- [x] `P2` `keyBy(pageId)`
+- [x] `P3` 5분 Tumbling Window + `AggregateFunction`(count) + `ProcessWindowFunction`(windowStart/End 부착) → `PageClickCount` `[window-pageclick-5m]` *(검증: window별 count 합 == 전체 CLICK 수)*
 
 ### 1차 — Sink
 - [ ] `K1` `PageClickCount` → OpenSearch 문서(JSON) 매핑 + deterministic doc id

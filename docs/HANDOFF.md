@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-13** (S5 완료) / 기준 커밋: `03ea38b` (S3) (+ S4·S5 미커밋 작업트리)
+> 최종 갱신: **2026-06-13** (P1·P2·P3 완료) / 기준 커밋: `d4ea7af` (S5) (+ P1·P2·P3 미커밋 작업트리)
 
 ---
 
@@ -19,8 +19,9 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S3** | Avro producer로 샘플 이벤트 적재 | ✅ 완료 |
 | **S4** | KafkaSource + Confluent Avro deser → `print()` | ✅ 완료 |
 | **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ✅ 완료 |
-| **P1** | `eventType == CLICK` 필터 `[filter-click]` | ⬜ **다음 차례** |
-| P2~ | keyBy / Window / Sink / Checkpoint | ⬜ |
+| **P1·P2·P3** | filter-click → keyBy(pageId) → 5min tumbling window → `PageClickCount` | ✅ 완료 |
+| **K1** | `PageClickCount` → OpenSearch 문서(JSON) + deterministic doc id | ⬜ **다음 차례** |
+| K2~ | OpenSearch Sink(bulk/retry) / 멱등성 / Checkpoint | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
 > **작업 규칙(중요):** 사용자는 **한 스텝씩만** 구현하고 멈추길 원함. 검증 게이트 통과 후 다음 진행. 임의로 다음 스텝 선행 금지.
@@ -40,11 +41,16 @@ filnk-practice/
     │   └── user-activity-event.avsc   # codegen source → UserActivityEvent
     └── java/com/example/flink/
         ├── producer/
-        │   └── SampleEventProducer.java          # S3: 샘플 Avro 이벤트 적재 producer
+        │   └── SampleEventProducer.java            # S3: 샘플 Avro 이벤트 적재 producer
         ├── source/
         │   └── UserActivityKafkaSourceFactory.java # S4: KafkaSource + Confluent Avro registry deser
+        ├── model/
+        │   └── PageClickCount.java                 # P3: 윈도우 집계 결과 POJO (sink 문서 원본)
+        ├── agg/
+        │   ├── PageClickCountAggregator.java       # P3: 증분 count AggregateFunction
+        │   └── PageClickWindowResultFunction.java  # P3: 윈도우 메타 부착 ProcessWindowFunction
         └── job/
-            └── FlinkUserActivityAnalyticsJob.java  # S5: DAG 조립(현재 source→assign-watermark→probe→print)
+            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립(현재 source→assign-watermark→filter-click→keyBy→window→print)
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -91,6 +97,21 @@ filnk-practice/
   - 검증용 `WatermarkProbe`(name/uid=`watermark-probe`): non-keyed `ProcessFunction<UserActivityEvent,String>`, 상태 없는 pass-through 진단기. 각 레코드의 `ctx.timestamp()`(부여된 event-time)·`ctx.timerService().currentWatermark()`·pageId/eventType를 한 줄 출력 → `print()`. S4의 `.print()` 자리를 대체하는 임시 스캐폴딩(P3 window가 붙으면 제거 예정).
   - ⚠️ event-time **타이머는 keyed stream에서만** 가능 → keyBy(P2) 전이라 probe에서 타이머로 watermark firing은 검증 불가. 실제 firing 검증은 P3 window에서.
 
+### P1·P2·P3 — filter-click → keyBy(pageId) → 5분 tumbling window (한 번에 구현)
+세 스텝을 한 묶음으로 구현. S5의 검증용 `watermark-probe`/`print-events`는 제거하고 윈도우 파이프라인으로 대체했다.
+DAG: `… → assign-watermark → filter-click → keyBy(pageId) → window-pageclick-5m → print-window-result`.
+
+- **P1 [filter-click]** (`job` 내 `.filter`): `eventType == "CLICK"`만 통과. operator name/uid=`filter-click`. VIEW 등 비-클릭 이벤트는 여기서 탈락.
+- **P2 keyBy(pageId)** (`job` 내 `.keyBy(UserActivityEvent::getPageId)`): pageId별 파티셔닝 → 동일 pageId는 동일 task에서 집계(가드레일 #7). keyBy는 partitioning이라 operator name/uid 미부여.
+- **P3 [window-pageclick-5m]**: `TumblingEventTimeWindows.of(Time.minutes(5))` + `aggregate(aggFn, windowFn)`.
+  - `model/PageClickCount.java`: 결과 POJO(`pageId`, `windowStart`, `windowEnd`, `count`). Flink POJO 규칙(무인자 ctor + private 필드 + getter/setter) 준수 → 효율적 직렬화. sink 문서(JSON) 원본.
+  - `agg/PageClickCountAggregator.java`: `AggregateFunction<UserActivityEvent, Long, Long>` — **증분** count(원본 이벤트 미적재, 누적 Long 1개만 상태로). `merge`도 구현(session window 대비).
+  - `agg/PageClickWindowResultFunction.java`: `ProcessWindowFunction<Long, PageClickCount, String, TimeWindow>` — 증분 결과(카운트 1건)에 window 메타(start/end)와 key(pageId)를 부착해 `PageClickCount` 방출. (레거시 `WindowFunction`의 현대적 대체 API)
+  - operator name/uid=`window-pageclick-5m`. 출력은 임시로 `.print()`(name/uid=`print-window-result`) — K1/K2에서 OpenSearch sink로 교체 예정.
+- ⚠️ **증분 집계(aggregate)** 선택 이유: `ProcessWindowFunction` 단독은 윈도우의 전 이벤트를 state에 버퍼링하지만, `AggregateFunction`과 결합하면 누적값만 유지해 state 폭증을 막는다(가드레일 #2·#8).
+- ⚠️ **윈도우 firing 타이밍**: bounded 모드는 end-of-input에서 final watermark(MAX) 방출로 전 윈도우 즉시 firing(검증 편함). streaming 모드는 `watermark > windowEnd`일 때(= windowEnd + 30s out-of-orderness 경과 시) firing.
+- ⚠️ 윈도우 경계는 **epoch 기준 정렬**(00/05/10분…), 이벤트의 첫 도착 시각이 아님.
+
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
 > ⚠️ 이 머신은 **colima** 런타임. `docker compose`(공백)가 아니라 **`docker-compose`(하이픈)** 사용. (자세한 환경 제약은 §6)
@@ -112,9 +133,26 @@ ls target/generated-sources/avro/com/example/flink/model/avro/UserActivityEvent.
 mvn -q compile exec:java                  # 기본 60건
 mvn -q compile exec:java -Dexec.args=200  # 건수 지정
 
-# (E) Flink Job 실행 (S4) — forked JVM. consumer group id 지정됨
-BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → print 출력
+# (E) Flink Job 실행 — forked JVM. consumer group id 지정됨. 현재 DAG = filter→keyBy→5min window
+BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → PageClickCount 출력
 mvn -q compile exec:exec@job              # 무한 스트리밍(실제 파이프라인). Ctrl+C로 종료
+```
+
+### P3 윈도우 집계 정합성 검증 커맨드
+```bash
+# 1) bounded 실행해서 윈도우 결과만 추출
+BOUNDED=true mvn -q compile exec:exec@job 2>&1 | grep PageClickCount
+
+# 2) 윈도우 카운트 합 (= 전체 CLICK 수와 일치해야 함: 필터+텀블링은 손실/중복 없이 CLICK을 분할)
+BOUNDED=true mvn -q compile exec:exec@job 2>&1 | grep PageClickCount \
+  | grep -oE 'count=[0-9]+' | grep -oE '[0-9]+' | paste -sd+ - | bc
+
+# 3) 토픽 전체 eventType 분포 (CLICK 수 직접 확인 → 위 합과 대조)
+docker-compose exec -T schema-registry kafka-avro-console-consumer \
+  --bootstrap-server kafka:29092 --topic user-activity-events \
+  --property schema.registry.url=http://schema-registry:8081 \
+  --from-beginning --max-messages <총건수> --timeout-ms 20000 2>/dev/null \
+  | grep -oE '"eventType":"[A-Z]+"' | sort | uniq -c
 ```
 
 ### S3 적재 내용 확인 커맨드
@@ -145,6 +183,7 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | 토픽 메시지 (S3 후) | `kafka.tools.GetOffsetShell ... --topic user-activity-events` | offset 합 = 적재 건수 (예: 60) |
 | Flink S4 read | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `UserActivityEvent` JSON이 적재 건수만큼 stdout 출력 |
 | Flink S5 watermark | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `[probe]` 라인마다 **recordTs == eventTime** (timestamp assigner 동작) |
+| Flink P1·P2·P3 window | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `PageClickCount{...}` 행, **카운트 합 == 전체 CLICK 수** |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
@@ -153,14 +192,16 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 > S4 실측: `BOUNDED=true` 실행으로 60건이 SpecificRecord로 역직렬화되어 print 출력(`9>`/`10>` prefix=source 병렬도), eventType 47 CLICK/13 VIEW, sessionId null·값 모두 정상. exit 0.
 >
 > S5 실측: `BOUNDED=true` 실행 → exit 0, probe 60건, **recordTs == eventTime 60/60 일치**(awk 파싱 확인). watermark는 bounded/버스트 입력이라 초기 레코드 전부 `MIN(uninitialized)`로 표시 — 주기적(기본 200ms) watermark 방출 전에 60건이 한 번에 통과하고 end-of-input에서 final MAX가 방출되기 때문(정상). watermark가 실제로 "진행"하는 모습은 P3 window/타이머에서 확인 예정.
+>
+> P1·P2·P3 실측: 토픽 총 320건(=기존 120 + 신규 200) 대상 `BOUNDED=true` 실행 → exit 0. 윈도우 결과 24행 출력, pageId 5종(search/product/cart/home/checkout)이 5분 윈도우별로 분리 집계됨. **윈도우 카운트 합 255 == 토픽 전체 CLICK 255건**(avro-console-consumer 분포: CLICK 255 / VIEW 65)으로 정확히 일치 → 필터(P1)·keyBy(P2)·텀블링 윈도우(P3)가 손실/중복 없이 동작. VIEW 65건은 filter-click에서 전량 제외 확인.
 
-## 5. 다음 할 일 — P1
+## 5. 다음 할 일 — K1
 
-CLAUDE.md `P1`: **`eventType == CLICK` 필터 `[filter-click]`.**
-- 현재 DAG 끝은 `assign-watermark → watermark-probe → print-events`. watermark까지 부여된 스트림(`timestamped`)에 `.filter(e -> "CLICK".equals(e.getEventType()))` operator를 추가(name/uid=`filter-click`).
-- 적용 위치: `assign-watermark` operator 결과(`timestamped`) **뒤**. 검증용 probe/print는 필터 뒤로 옮기거나 유지하며 CLICK만 남는지 확인.
-- 검증 게이트(예상): 필터 후 VIEW 이벤트가 사라지고 CLICK만 남는지(예: probe 출력 eventType 전부 CLICK, 건수 = 적재 중 CLICK 수).
-- ⚠️ **사용자 요청 전까지 선행 구현 금지.** (한 스텝씩 — keyBy(P2)/window(P3)는 P1 검증 후에)
+CLAUDE.md `K1`: **`PageClickCount` → OpenSearch 문서(JSON) 매핑 + deterministic doc id.**
+- 현재 DAG 끝은 `window-pageclick-5m → print-window-result`. 이 `.print()`를 OpenSearch sink(K2)로 대체하기 전 단계로, `PageClickCount`를 JSON 문서 + doc id로 변환하는 매핑을 만든다.
+- 인덱스 `user-activity-agg`, **문서 ID = `pageId_windowStart_windowEnd_eventType`**(deterministic → 재처리 시 덮어쓰기로 멱등). CLAUDE.md "OpenSearch 인덱스 & 문서 ID" 표 참조.
+- 가드레일: 입력 Avro / **출력 JSON**(Jackson). `sink/OpenSearchDocs`(문서+id 생성)·`sink/OpenSearchSinkFactory`는 CLAUDE.md 패키지 구조에 예정됨. Jackson 의존성은 이 단계에서 pom에 추가.
+- ⚠️ **사용자 요청 전까지 선행 구현 금지.** (K1 매핑 → K2 sink 연결 → K3 멱등성 순서)
 
 ## 6. 환경 제약 (Apple Silicon + colima) — 반드시 숙지
 
@@ -175,9 +216,13 @@ CLAUDE.md `P1`: **`eventType == CLICK` 필터 `[filter-click]`.**
 ## 7. Git
 
 - 원격: `git@github.com:pado0/flink-user-event-pipeline.git` (SSH), `origin/main` 추적 설정 완료.
-- 커밋 `672140f` `chore: 프로젝트 스캐폴딩 (S1 Avro 스키마 + S2 로컬 인프라)` 푸시 완료.
-- 커밋 `03ea38b` `feat: S3 Avro 샘플 이벤트 producer 적재` — **로컬 커밋만, 미푸시**.
-- **S4·S5 작업은 아직 미커밋** (작업트리): `pom.xml`(Flink 의존성·exec job 실행, S4), `src/.../source/UserActivityKafkaSourceFactory.java`(S4), `src/.../job/FlinkUserActivityAnalyticsJob.java`(S4 source→print + **S5 assign-watermark·watermark-probe**), `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상(S4·S5 분리 커밋 권장).
+- 커밋 이력:
+  - `672140f` `chore: 프로젝트 스캐폴딩 (S1 Avro 스키마 + S2 로컬 인프라)` — 푸시 완료
+  - `03ea38b` `feat: S3 Avro 샘플 이벤트 producer 적재`
+  - `7339e36` `feat: S4 KafkaSource + Confluent Avro registry deser → print()`
+  - `d4ea7af` `feat: S5 Event Time / Watermark 부여 + handoff 문서 갱신`
+- ⚠️ 현재 로컬이 `origin/main`보다 **앞서 있음**(S3·S4·S5 미푸시). push는 사용자 요청 시.
+- **P1·P2·P3 작업은 미커밋**(작업트리): `model/PageClickCount.java`, `agg/PageClickCountAggregator.java`, `agg/PageClickWindowResultFunction.java`(신규) + `job/FlinkUserActivityAnalyticsJob.java`(probe 제거, filter→keyBy→window 연결) + `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상.
 
 ## 8. 참고
 
