@@ -288,8 +288,10 @@ CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
   - `d4ea7af` `feat: S5 Event Time / Watermark 부여 + handoff 문서 갱신`
   - `6258919` `feat: P1·P2·P3 filter-click → keyBy(pageId) → 5min tumbling window`
   - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정`
-  - `103d7ab` `feat: K1·K2·K3 OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등)` ← 현재 HEAD
-- **`origin/main`과 동기화 완료** (HEAD = `103d7ab`, 작업트리 clean). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신.)
+  - `103d7ab` `feat: K1·K2·K3 OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등)`
+  - `0f8aeef` `docs: HANDOFF Git 섹션을 103d7ab(K1·K2·K3) 커밋·푸시 반영으로 정정`
+  - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가` ← 현재 HEAD
+- **`origin/main`과 동기화 완료** (HEAD = `d162d31`, 작업트리 clean). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. `d162d31` 변경: `CLAUDE.md`/`docs/HANDOFF.md`에 W1 Web UI 스텝 추가 — 문서만, 코드 미변경.)
 
 ## 8. 참고
 
