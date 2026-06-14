@@ -165,6 +165,9 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `K2` OpenSearch Sink 연결(bulk, retry) `[sink-opensearch-agg]` *(검증: `user-activity-agg` 인덱스에 문서)*
 - [x] `K3` 멱등성 검증 — 동일 입력 재처리 시 문서 수 불변(덮어쓰기)
 
+### 1차 — Web UI (로컬 관측)
+- [ ] `W1` 로컬 MiniCluster **Flink Web UI** 활성화 — `flink-runtime-web`(`provided`) 추가 + env를 `StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf)`로 교체, `RestOptions.PORT = 8082` 지정(**8081은 Schema Registry와 충돌**). *(검증: 무한 스트리밍(`BOUNDED=false`)으로 실행 중 `http://localhost:8082`에서 DAG의 operator name/uid 라벨 · operator별 backpressure/numRecordsIn·Out · watermark · (R1 이후) checkpoint 확인. **UI는 Job 실행 중에만 생존** → `BOUNDED=true`는 즉시 종료돼 관찰 불가.)*
+
 ### 1차 — Runtime
 - [ ] `R1` Checkpoint 활성화(60s) + Kafka offset checkpoint 연동
 - [ ] `R2` 전 operator `.name()` + `.uid()`

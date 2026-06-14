@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-13** (K1·K2·K3 OpenSearch sink 완료) / 기준 커밋: `0f8609e` (+ K1·K2·K3 미커밋 작업트리)
+> 최종 갱신: **2026-06-13** (K1·K2·K3 OpenSearch sink 완료 + `W1` Web UI 스텝을 Runtime 앞에 추가 — 계획만, 미구현) / 기준 커밋: `103d7ab` (작업트리 clean; `W1`은 문서에만 반영)
 
 ---
 
@@ -21,7 +21,8 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ✅ 완료 |
 | **P1·P2·P3** | filter-click → keyBy(pageId) → 5min tumbling window → `PageClickCount` | ✅ 완료 |
 | **K1·K2·K3** | `PageClickCount` → JSON 문서(deterministic id) → OpenSearch sink(bulk/retry) + 멱등성 검증 | ✅ 완료 |
-| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ **다음 차례** |
+| **W1** | 로컬 MiniCluster Flink Web UI 활성화(`flink-runtime-web` + `createLocalEnvironmentWithWebUI`, port 8082) | ⬜ **다음 차례** |
+| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ |
 | R2·R3 | 전 operator name/uid 점검 / E2E 검증 | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
@@ -247,13 +248,23 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 >
 > K1·K2·K3 실측: 토픽 320건 대상 `BOUNDED=true` 실행 → exit 0(BUILD SUCCESS). `user-activity-agg` 인덱스에 **문서 24건**(P3 윈도우 24행과 일치), **count 합계 255.0 == 전체 CLICK 255**, pageId 분포 page-cart/checkout/product/search 각 5 + page-home 4 = 24. 샘플 `_id`=`page-product_1781323500000_1781323800000_CLICK`(deterministic 규칙 정확), `_source`에 pageId/eventType/window(start·end·Iso)/count 필드 정상. **K3 멱등성**: 동일 입력으로 job 재실행 → 문서 수 **24 그대로**(중복 0), 동일 doc의 `_version` 1→2(덮어쓰기 발생), `count`=11 동일, 합계 255 동일 → deterministic id 기반 upsert로 멱등 확인.
 
-## 5. 다음 할 일 — R1 (Runtime: Checkpoint)
+## 5. 다음 할 일 — W1 (Web UI: 로컬 MiniCluster 대시보드) → 이후 R1
 
+> **방법 A**(로컬 MiniCluster에 Web UI 부착)로 결정. 실 클러스터 제출(`start-cluster.sh` + `flink run`)은 fat-jar(shade)가 필요해 후순위.
+
+CLAUDE.md `W1`: **로컬 MiniCluster Flink Web UI 활성화.**
+- `pom.xml`: `org.apache.flink:flink-runtime-web:1.18.1` 추가, scope **`provided`**(다른 flink 런타임 의존성과 동일 정책 — Flink dist 제공, fat-jar 미포함).
+- `job/FlinkUserActivityAnalyticsJob.java`: env 생성을 `StreamExecutionEnvironment.getExecutionEnvironment()` → `createLocalEnvironmentWithWebUI(conf)`로 교체. `Configuration conf`에 `RestOptions.PORT = 8082` 지정.
+- ⚠️ **포트 8082 사용** — 기본 8081은 docker-compose Schema Registry가 점유.
+- ⚠️ **Web UI는 Job 실행 중에만 생존** → `BOUNDED=false`(무한 스트리밍)로 띄워야 관찰 가능. `BOUNDED=true`는 end-of-input에서 즉시 종료돼 UI 접속 불가.
+- 검증: 무한 스트리밍 실행 후 `http://localhost:8082` → DAG(operator name/uid 라벨 그대로 노출, 가드레일 #4) · operator별 backpressure/numRecordsIn·Out · watermark · (R1 적용 후) checkpoint 확인. 종료는 Ctrl+C.
+- ⚠️ **사용자 요청 전까지 선행 구현 금지.** 한 스텝씩 검증 게이트 통과 후 진행.
+
+### 그다음 — R1 (Runtime: Checkpoint)
 CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
 - `job`의 env 설정에 `env.enableCheckpointing(60_000)` 추가. 추가 고려(CLAUDE.md "Checkpoint / State 설정"): checkpoint timeout, min pause between checkpoints, tolerable checkpoint failure number, externalized checkpoint **retain on cancellation**, state backend(메모리→RocksDB) 교체 여지.
 - Kafka offset은 Flink checkpoint와 함께 관리(별도 auto-commit 의존 X) — KafkaSource는 checkpoint 시 offset을 함께 스냅샷.
 - 이후 `R2`(전 operator name/uid 점검 — 대부분 부여됨, 누락 확인), `R3`(E2E 검증: produce → agg 인덱스).
-- ⚠️ **사용자 요청 전까지 선행 구현 금지.** 한 스텝씩 검증 게이트 통과 후 진행.
 
 > 참고: AT_LEAST_ONCE sink는 checkpoint 시점에 pending bulk를 flush한다. 현재는 checkpoint 미활성이라 bulk interval(2s)/close flush로 적재되며, R1에서 checkpoint를 켜면 sink flush가 checkpoint와 정렬된다(멱등 id 덕에 정확성은 이미 보장).
 
