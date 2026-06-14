@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-13** (P1·P2·P3 완료) / 기준 커밋: `d4ea7af` (S5) (+ P1·P2·P3 미커밋 작업트리)
+> 최종 갱신: **2026-06-13** (K1·K2·K3 OpenSearch sink 완료) / 기준 커밋: `0f8609e` (+ K1·K2·K3 미커밋 작업트리)
 
 ---
 
@@ -20,8 +20,9 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S4** | KafkaSource + Confluent Avro deser → `print()` | ✅ 완료 |
 | **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ✅ 완료 |
 | **P1·P2·P3** | filter-click → keyBy(pageId) → 5min tumbling window → `PageClickCount` | ✅ 완료 |
-| **K1** | `PageClickCount` → OpenSearch 문서(JSON) + deterministic doc id | ⬜ **다음 차례** |
-| K2~ | OpenSearch Sink(bulk/retry) / 멱등성 / Checkpoint | ⬜ |
+| **K1·K2·K3** | `PageClickCount` → JSON 문서(deterministic id) → OpenSearch sink(bulk/retry) + 멱등성 검증 | ✅ 완료 |
+| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ **다음 차례** |
+| R2·R3 | 전 operator name/uid 점검 / E2E 검증 | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
 > **작업 규칙(중요):** 사용자는 **한 스텝씩만** 구현하고 멈추길 원함. 검증 게이트 통과 후 다음 진행. 임의로 다음 스텝 선행 금지.
@@ -49,8 +50,11 @@ filnk-practice/
         ├── agg/
         │   ├── PageClickCountAggregator.java       # P3: 증분 count AggregateFunction
         │   └── PageClickWindowResultFunction.java  # P3: 윈도우 메타 부착 ProcessWindowFunction
+        ├── sink/
+        │   ├── OpenSearchDocs.java                 # K1: PageClickCount → JSON 문서(Jackson) + deterministic doc id
+        │   └── OpenSearchSinkFactory.java          # K2: Opensearch2Sink(bulk/retry, at-least-once)
         └── job/
-            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립(현재 source→assign-watermark→filter-click→keyBy→window→print)
+            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립(현재 source→assign-watermark→filter-click→keyBy→window→sink-opensearch-agg)
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -112,6 +116,27 @@ DAG: `… → assign-watermark → filter-click → keyBy(pageId) → window-pag
 - ⚠️ **윈도우 firing 타이밍**: bounded 모드는 end-of-input에서 final watermark(MAX) 방출로 전 윈도우 즉시 firing(검증 편함). streaming 모드는 `watermark > windowEnd`일 때(= windowEnd + 30s out-of-orderness 경과 시) firing.
 - ⚠️ 윈도우 경계는 **epoch 기준 정렬**(00/05/10분…), 이벤트의 첫 도착 시각이 아님.
 
+### K1·K2·K3 — OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등성, 한 번에 구현)
+세 스텝을 한 묶음으로 구현. P3의 `print-window-result`를 OpenSearch sink로 대체했다.
+DAG: `… → window-pageclick-5m → sink-opensearch-agg`.
+
+- **K1 [매핑]** `sink/OpenSearchDocs.java`: `PageClickCount` → OpenSearch 문서.
+  - **문서 ID(deterministic)** = `pageId_windowStart_windowEnd_CLICK`. eventType은 filter-click(P1)을 거쳐 항상 `CLICK`이라 상수로 박음. CLAUDE.md "OpenSearch 인덱스 & 문서 ID" 표의 `pageId_windowStart_windowEnd_eventType` 규칙.
+  - **문서 본문(JSON)** = Jackson `ObjectMapper.writeValueAsBytes(Map)`. 필드: `pageId`, `eventType`, `windowStart`/`windowEnd`(epoch ms), `windowStartIso`/`windowEndIso`(Dashboards용 ISO-8601 보조), `count`. 가드레일 #3(입력 Avro / **출력 JSON**) 준수 — Jackson은 sink 직렬화 전용.
+  - ⚠️ `emit`이 checked 예외를 못 던지므로 `JsonProcessingException`은 `OpenSearchDocs` 내부에서 `IllegalStateException`으로 감쌈(제어된 Map이라 실질 도달 불가).
+- **K2 [sink]** `sink/OpenSearchSinkFactory.java`: `Opensearch2Sink<PageClickCount>` (통합 `Sink` API, `DataStream.sinkTo(...)`).
+  - emitter: `new IndexRequest(AGG_INDEX).id(docId).source(jsonBytes, XContentType.JSON)` → `indexer.add(...)`.
+  - **Bulk**: `setBulkFlushMaxActions(500)` / `setBulkFlushMaxSizeMb(2)` / `setBulkFlushInterval(2000ms)` (먼저 도달하는 조건에서 flush). **Retry**: `setBulkFlushBackoffStrategy(EXPONENTIAL, 5, 1000ms)`.
+  - `setDeliveryGuarantee(AT_LEAST_ONCE)` + deterministic id = **effectively idempotent**. (OpenSearch는 트랜잭션 sink가 아님 — 가드레일 #5)
+  - operator name/uid = `sink-opensearch-agg`.
+- **K3 [멱등성]**: 동일 입력 재처리 시 같은 doc id로 덮어쓰기(upsert) → 문서 수 불변. (검증은 §4 참조)
+- **DAG/job**: `job/FlinkUserActivityAnalyticsJob.java`에서 `print()` → `.sinkTo(OpenSearchSinkFactory.aggSink(host, port, scheme))`. env override 추가: `OPENSEARCH_HOST`(localhost) / `OPENSEARCH_PORT`(9200) / `OPENSEARCH_SCHEME`(http).
+- ⚠️ **의존성 정정/함정** (`pom.xml`):
+  - CLAUDE.md에 적혀 있던 `flink-connector-opensearch2:1.2.0-1.18`은 **존재하지 않음**(`1.2.0-1.18`은 OpenSearch **1.x**용 `flink-connector-opensearch`의 버전). OpenSearch 2.x용 정확한 좌표는 **`flink-connector-opensearch2:2.0.0-1.18`**. (CLAUDE.md도 정정함)
+  - 이 커넥터는 OpenSearch 클라이언트 **2.13.0**을 번들 → 서버 2.11.1과 2.x 호환(정상 동작 확인).
+  - **jackson 충돌**: avro 1.11.3이 `jackson-core:2.14.2`를 전이로 끌어와, opensearch 클라이언트가 쓰는 jackson(2.17.0, `StreamConstraintsException`은 2.15+)과 충돌 → 런타임 `NoClassDefFoundError`. **`dependencyManagement`로 `jackson-bom:2.17.0`을 import**해 전 jackson 모듈을 2.17.0으로 고정(depth 무관 override)하여 해결. `jackson-databind`는 compile로 명시.
+  - opensearch2 커넥터/jackson은 **compile**(이후 shade 대상) — Flink dist에 없으므로 provided 아님. exec:exec@job(classpathScope=compile)에 자동 포함.
+
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
 > ⚠️ 이 머신은 **colima** 런타임. `docker compose`(공백)가 아니라 **`docker-compose`(하이픈)** 사용. (자세한 환경 제약은 §6)
@@ -133,9 +158,11 @@ ls target/generated-sources/avro/com/example/flink/model/avro/UserActivityEvent.
 mvn -q compile exec:java                  # 기본 60건
 mvn -q compile exec:java -Dexec.args=200  # 건수 지정
 
-# (E) Flink Job 실행 — forked JVM. consumer group id 지정됨. 현재 DAG = filter→keyBy→5min window
-BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → PageClickCount 출력
+# (E) Flink Job 실행 — forked JVM. consumer group id 지정됨.
+#     현재 DAG = filter→keyBy→5min window→OpenSearch sink(user-activity-agg)
+BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → OpenSearch 적재 후 종료
 mvn -q compile exec:exec@job              # 무한 스트리밍(실제 파이프라인). Ctrl+C로 종료
+# env override: OPENSEARCH_HOST(localhost) / OPENSEARCH_PORT(9200) / OPENSEARCH_SCHEME(http)
 ```
 
 ### P3 윈도우 집계 정합성 검증 커맨드
@@ -153,6 +180,27 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
   --property schema.registry.url=http://schema-registry:8081 \
   --from-beginning --max-messages <총건수> --timeout-ms 20000 2>/dev/null \
   | grep -oE '"eventType":"[A-Z]+"' | sort | uniq -c
+```
+
+### K1·K2·K3 OpenSearch sink 검증 커맨드
+```bash
+# 0) sink 실행 후 인덱스 refresh (검색 가시화)
+curl -s -XPOST localhost:9200/user-activity-agg/_refresh
+
+# 1) 문서 수 (= window 결과 행 수, P3 검증의 24행과 일치해야 함)
+curl -s localhost:9200/user-activity-agg/_count
+
+# 2) count 합계(= 전체 CLICK 수 255) + pageId 분포
+curl -s localhost:9200/user-activity-agg/_search -H 'Content-Type: application/json' -d '{
+  "size":0,
+  "aggs":{"total_clicks":{"sum":{"field":"count"}},
+          "by_page":{"terms":{"field":"pageId.keyword","size":10}}}}'
+
+# 3) 샘플 문서 1건 — _id = pageId_windowStart_windowEnd_CLICK 형식 확인
+curl -s 'localhost:9200/user-activity-agg/_search?size=1'
+
+# 4) K3 멱등성: BOUNDED job을 2회 실행 → 문서 수 불변(중복 X), _version만 증가(덮어쓰기)
+curl -s 'localhost:9200/user-activity-agg/_doc/<docId>' | grep -oE '"_version":[0-9]+'
 ```
 
 ### S3 적재 내용 확인 커맨드
@@ -184,6 +232,8 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | Flink S4 read | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `UserActivityEvent` JSON이 적재 건수만큼 stdout 출력 |
 | Flink S5 watermark | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `[probe]` 라인마다 **recordTs == eventTime** (timestamp assigner 동작) |
 | Flink P1·P2·P3 window | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `PageClickCount{...}` 행, **카운트 합 == 전체 CLICK 수** |
+| Flink K1·K2 sink | `BOUNDED=true … ; curl …/user-activity-agg/_count` | exit 0, 문서 24건, **count 합 == 255(전체 CLICK)**, `_id`=deterministic |
+| Flink K3 멱등성 | BOUNDED job 2회 실행 후 `_count`/`_version` | 문서 수 **24 불변**, `_version` 1→2(덮어쓰기), count 동일 |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
@@ -194,14 +244,18 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 > S5 실측: `BOUNDED=true` 실행 → exit 0, probe 60건, **recordTs == eventTime 60/60 일치**(awk 파싱 확인). watermark는 bounded/버스트 입력이라 초기 레코드 전부 `MIN(uninitialized)`로 표시 — 주기적(기본 200ms) watermark 방출 전에 60건이 한 번에 통과하고 end-of-input에서 final MAX가 방출되기 때문(정상). watermark가 실제로 "진행"하는 모습은 P3 window/타이머에서 확인 예정.
 >
 > P1·P2·P3 실측: 토픽 총 320건(=기존 120 + 신규 200) 대상 `BOUNDED=true` 실행 → exit 0. 윈도우 결과 24행 출력, pageId 5종(search/product/cart/home/checkout)이 5분 윈도우별로 분리 집계됨. **윈도우 카운트 합 255 == 토픽 전체 CLICK 255건**(avro-console-consumer 분포: CLICK 255 / VIEW 65)으로 정확히 일치 → 필터(P1)·keyBy(P2)·텀블링 윈도우(P3)가 손실/중복 없이 동작. VIEW 65건은 filter-click에서 전량 제외 확인.
+>
+> K1·K2·K3 실측: 토픽 320건 대상 `BOUNDED=true` 실행 → exit 0(BUILD SUCCESS). `user-activity-agg` 인덱스에 **문서 24건**(P3 윈도우 24행과 일치), **count 합계 255.0 == 전체 CLICK 255**, pageId 분포 page-cart/checkout/product/search 각 5 + page-home 4 = 24. 샘플 `_id`=`page-product_1781323500000_1781323800000_CLICK`(deterministic 규칙 정확), `_source`에 pageId/eventType/window(start·end·Iso)/count 필드 정상. **K3 멱등성**: 동일 입력으로 job 재실행 → 문서 수 **24 그대로**(중복 0), 동일 doc의 `_version` 1→2(덮어쓰기 발생), `count`=11 동일, 합계 255 동일 → deterministic id 기반 upsert로 멱등 확인.
 
-## 5. 다음 할 일 — K1
+## 5. 다음 할 일 — R1 (Runtime: Checkpoint)
 
-CLAUDE.md `K1`: **`PageClickCount` → OpenSearch 문서(JSON) 매핑 + deterministic doc id.**
-- 현재 DAG 끝은 `window-pageclick-5m → print-window-result`. 이 `.print()`를 OpenSearch sink(K2)로 대체하기 전 단계로, `PageClickCount`를 JSON 문서 + doc id로 변환하는 매핑을 만든다.
-- 인덱스 `user-activity-agg`, **문서 ID = `pageId_windowStart_windowEnd_eventType`**(deterministic → 재처리 시 덮어쓰기로 멱등). CLAUDE.md "OpenSearch 인덱스 & 문서 ID" 표 참조.
-- 가드레일: 입력 Avro / **출력 JSON**(Jackson). `sink/OpenSearchDocs`(문서+id 생성)·`sink/OpenSearchSinkFactory`는 CLAUDE.md 패키지 구조에 예정됨. Jackson 의존성은 이 단계에서 pom에 추가.
-- ⚠️ **사용자 요청 전까지 선행 구현 금지.** (K1 매핑 → K2 sink 연결 → K3 멱등성 순서)
+CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
+- `job`의 env 설정에 `env.enableCheckpointing(60_000)` 추가. 추가 고려(CLAUDE.md "Checkpoint / State 설정"): checkpoint timeout, min pause between checkpoints, tolerable checkpoint failure number, externalized checkpoint **retain on cancellation**, state backend(메모리→RocksDB) 교체 여지.
+- Kafka offset은 Flink checkpoint와 함께 관리(별도 auto-commit 의존 X) — KafkaSource는 checkpoint 시 offset을 함께 스냅샷.
+- 이후 `R2`(전 operator name/uid 점검 — 대부분 부여됨, 누락 확인), `R3`(E2E 검증: produce → agg 인덱스).
+- ⚠️ **사용자 요청 전까지 선행 구현 금지.** 한 스텝씩 검증 게이트 통과 후 진행.
+
+> 참고: AT_LEAST_ONCE sink는 checkpoint 시점에 pending bulk를 flush한다. 현재는 checkpoint 미활성이라 bulk interval(2s)/close flush로 적재되며, R1에서 checkpoint를 켜면 sink flush가 checkpoint와 정렬된다(멱등 id 덕에 정확성은 이미 보장).
 
 ## 6. 환경 제약 (Apple Silicon + colima) — 반드시 숙지
 
@@ -222,7 +276,8 @@ CLAUDE.md `K1`: **`PageClickCount` → OpenSearch 문서(JSON) 매핑 + determin
   - `7339e36` `feat: S4 KafkaSource + Confluent Avro registry deser → print()`
   - `d4ea7af` `feat: S5 Event Time / Watermark 부여 + handoff 문서 갱신`
   - `6258919` `feat: P1·P2·P3 filter-click → keyBy(pageId) → 5min tumbling window`
-- **`origin/main`과 동기화 완료** (HEAD = `6258919`, 작업트리 clean). S1~P3 전부 푸시됨.
+  - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정` ← 현재 HEAD(푸시됨)
+- **K1·K2·K3는 아직 미커밋**(작업트리). 변경: `pom.xml`(opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind), `job/FlinkUserActivityAnalyticsJob.java`(sink 연결), 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. 커밋 메시지(안): `feat: K1·K2·K3 OpenSearch sink(JSON 문서 + deterministic id + bulk/retry + 멱등)`.
 
 ## 8. 참고
 

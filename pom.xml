@@ -13,7 +13,8 @@
     S1: Avro .avsc → UserActivityEvent(SpecificRecord) codegen.
     S3: 샘플 이벤트 적재용 Kafka producer + Confluent KafkaAvroSerializer(Schema Registry 연동).
     S4: Flink KafkaSource + Confluent Avro registry deser → print().
-    OpenSearch sink / maven-shade-plugin(fat-jar)은 이후 스텝에서 추가한다.
+    K1·K2: OpenSearch 2.x sink(flink-connector-opensearch2) + JSON 직렬화(jackson-databind).
+    maven-shade-plugin(fat-jar)은 이후 스텝에서 추가한다.
   -->
 
   <properties>
@@ -24,8 +25,13 @@
     <kafka.version>3.6.1</kafka.version>
     <confluent.version>7.6.1</confluent.version>
     <flink.version>1.18.1</flink.version>
-    <!-- 외부화된 Kafka 커넥터 버전 표기: <connector>-<flink minor> -->
+    <!-- 외부화된 커넥터 버전 표기: <connector>-<flink minor> -->
     <flink.connector.kafka.version>3.1.0-1.18</flink.connector.kafka.version>
+    <!-- OpenSearch 2.x용 sink 커넥터. (1.x용은 flink-connector-opensearch:1.2.0-1.18 — 혼동 주의)
+         opensearch2 2.0.0-1.18은 OpenSearch 클라이언트 2.13.0을 번들(서버 2.11.1과 2.x 호환). -->
+    <flink.connector.opensearch.version>2.0.0-1.18</flink.connector.opensearch.version>
+    <!-- sink JSON 직렬화 전용. opensearch-x-content 2.13.0이 쓰는 jackson과 동일 버전으로 정렬. -->
+    <jackson.version>2.17.0</jackson.version>
   </properties>
 
   <!-- Confluent KafkaAvroSerializer / schema-registry-client 해석용 레포 -->
@@ -35,6 +41,23 @@
       <url>https://packages.confluent.io/maven/</url>
     </repository>
   </repositories>
+
+  <!--
+    jackson 버전 강제 정렬: avro 1.11.3이 jackson-core 2.14.2를 전이로 끌어와 OpenSearch 클라이언트
+    (2.17.0, StreamConstraintsException 2.15+ 필요)와 충돌 → NoClassDefFoundError. bom import로
+    모든 jackson 모듈을 2.17.0으로 고정한다(depth 무관 override). avro는 2.17.0과 하위호환.
+  -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
@@ -93,6 +116,20 @@
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-avro-confluent-registry</artifactId>
       <version>${flink.version}</version>
+    </dependency>
+
+    <!-- K2 OpenSearch 2.x sink (bulk/retry). opensearch rest-high-level-client + httpclient를
+         전이로 가져옴(Flink dist에 없으므로 compile=shade 대상). -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-opensearch2</artifactId>
+      <version>${flink.connector.opensearch.version}</version>
+    </dependency>
+    <!-- K1 sink JSON 직렬화 전용 (가드레일 #3: 입력 Avro / 출력 JSON). -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
     </dependency>
   </dependencies>
 

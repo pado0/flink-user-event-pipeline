@@ -31,9 +31,9 @@ Kafka(user-activity-events, Avro + Schema Registry)
   - `org.apache.flink:flink-connector-kafka:3.1.0-1.18`
   - `org.apache.flink:flink-avro:1.18.1`
   - `org.apache.flink:flink-avro-confluent-registry:1.18.1`  *(Registry 연동 deser)*
-  - `org.apache.flink:flink-connector-opensearch2:1.2.0-1.18` *(OpenSearch 2.x용; 좌표/버전 검증 필요)*
+  - `org.apache.flink:flink-connector-opensearch2:2.0.0-1.18` *(OpenSearch 2.x용 — 검증 완료. `1.2.0-1.18`은 OpenSearch **1.x**용 `flink-connector-opensearch`이니 혼동 주의. opensearch2 2.0.0-1.18은 OpenSearch 클라이언트 2.13.0을 번들 → 서버 2.11.1과 2.x 호환)*
   - `org.apache.avro:avro:1.11.3` + `avro-maven-plugin` *(.avsc → SpecificRecord codegen)*
-  - `com.fasterxml.jackson.core:jackson-databind` — **sink JSON 직렬화 전용** (입력은 Avro)
+  - `com.fasterxml.jackson.core:jackson-databind:2.17.0` — **sink JSON 직렬화 전용** (입력은 Avro). ⚠️ avro 1.11.3이 jackson-core 2.14.2를 전이로 끌어와 opensearch 클라이언트(2.17.0)와 충돌하므로 **jackson-bom 2.17.0을 `dependencyManagement`로 import**해 전 모듈 버전 고정 필요.
   - 테스트: `flink-test-utils`, `flink-runtime`(MiniCluster), `junit-jupiter`
 - **Confluent Maven 레포 추가** 필요: `https://packages.confluent.io/maven/` (registry client 해석용)
 - Flink 런타임은 `provided` scope, 커넥터/avro/registry/jackson만 shade에 포함.
@@ -161,9 +161,9 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `P3` 5분 Tumbling Window + `AggregateFunction`(count) + `ProcessWindowFunction`(windowStart/End 부착) → `PageClickCount` `[window-pageclick-5m]` *(검증: window별 count 합 == 전체 CLICK 수)*
 
 ### 1차 — Sink
-- [ ] `K1` `PageClickCount` → OpenSearch 문서(JSON) 매핑 + deterministic doc id
-- [ ] `K2` OpenSearch Sink 연결(bulk, retry) `[sink-opensearch-agg]` *(검증: `user-activity-agg` 인덱스에 문서)*
-- [ ] `K3` 멱등성 검증 — 동일 입력 재처리 시 문서 수 불변(덮어쓰기)
+- [x] `K1` `PageClickCount` → OpenSearch 문서(JSON) 매핑 + deterministic doc id
+- [x] `K2` OpenSearch Sink 연결(bulk, retry) `[sink-opensearch-agg]` *(검증: `user-activity-agg` 인덱스에 문서)*
+- [x] `K3` 멱등성 검증 — 동일 입력 재처리 시 문서 수 불변(덮어쓰기)
 
 ### 1차 — Runtime
 - [ ] `R1` Checkpoint 활성화(60s) + Kafka offset checkpoint 연동

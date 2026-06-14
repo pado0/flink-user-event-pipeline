@@ -4,6 +4,7 @@ import com.example.flink.agg.PageClickCountAggregator;
 import com.example.flink.agg.PageClickWindowResultFunction;
 import com.example.flink.model.PageClickCount;
 import com.example.flink.model.avro.UserActivityEvent;
+import com.example.flink.sink.OpenSearchSinkFactory;
 import com.example.flink.source.UserActivityKafkaSourceFactory;
 import java.time.Duration;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
@@ -17,17 +18,18 @@ import org.apache.flink.streaming.api.windowing.time.Time;
 /**
  * Flink user-activity 분석 파이프라인 Job (DAG 조립 + env 설정).
  *
- * <p>현재 구현 단계: <b>P3</b> — Event Time 부여한 스트림을 CLICK 필터 → pageId keyBy →
- * 5분 tumbling window로 집계해 {@link PageClickCount}를 산출한다. OpenSearch Sink(K2)는 다음 스텝.
+ * <p>현재 구현 단계: <b>K1·K2</b> — Event Time 부여한 스트림을 CLICK 필터 → pageId keyBy →
+ * 5분 tumbling window로 집계({@link PageClickCount})한 뒤, JSON 문서(deterministic id)로 매핑해
+ * OpenSearch {@code user-activity-agg} 인덱스에 bulk/retry로 적재한다.
  *
  * <p>현재 DAG:
  * <pre>
  *   source-user-activity-events  → assign-watermark → filter-click → keyBy(pageId)
  *   (Kafka + Avro deser)           (Event Time, 30s    (eventType
  *                                   out-of-orderness)   == CLICK)
- *       → window-pageclick-5m  → print-window-result
- *         (5min tumbling,        (콘솔 출력 — K2에서
- *          count → PageClickCount) OpenSearch sink로 대체 예정)
+ *       → window-pageclick-5m  → sink-opensearch-agg
+ *         (5min tumbling,        (PageClickCount → JSON 문서 + deterministic id
+ *          count → PageClickCount) → OpenSearch bulk/retry, 멱등 upsert)
  * </pre>
  *
  * <p>실행(로컬 MiniCluster):
@@ -36,7 +38,8 @@ import org.apache.flink.streaming.api.windowing.time.Time;
  *   BOUNDED=true mvn -q compile exec:exec@job    # 시작 시점까지만 읽고 종료(검증용)
  * </pre>
  * 엔드포인트/그룹은 환경변수 {@code BOOTSTRAP_SERVERS} / {@code SCHEMA_REGISTRY_URL} /
- * {@code KAFKA_GROUP_ID} / {@code BOUNDED}로 override 가능.
+ * {@code KAFKA_GROUP_ID} / {@code BOUNDED} / {@code OPENSEARCH_HOST} / {@code OPENSEARCH_PORT} /
+ * {@code OPENSEARCH_SCHEME}로 override 가능.
  */
 public final class FlinkUserActivityAnalyticsJob {
 
@@ -59,6 +62,9 @@ public final class FlinkUserActivityAnalyticsJob {
         String registry = getenvOr("SCHEMA_REGISTRY_URL", "http://localhost:8081");
         String groupId = getenvOr("KAFKA_GROUP_ID", DEFAULT_GROUP_ID);
         boolean bounded = Boolean.parseBoolean(getenvOr("BOUNDED", "false"));
+        String opensearchHost = getenvOr("OPENSEARCH_HOST", "localhost");
+        int opensearchPort = Integer.parseInt(getenvOr("OPENSEARCH_PORT", "9200"));
+        String opensearchScheme = getenvOr("OPENSEARCH_SCHEME", "http");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
@@ -92,10 +98,12 @@ public final class FlinkUserActivityAnalyticsJob {
                 .aggregate(new PageClickCountAggregator(), new PageClickWindowResultFunction())
                 .name("window-pageclick-5m").uid("window-pageclick-5m");
 
-        // P3 검증: 윈도우별 pageId 카운트를 콘솔 출력. (K1/K2에서 OpenSearch sink로 대체 예정)
+        // K1·K2 [sink-opensearch-agg]: PageClickCount → JSON 문서(deterministic id) → OpenSearch.
+        //   K1 매핑(OpenSearchDocs) + K2 sink(bulk/retry, at-least-once). 같은 윈도우 결과는 같은
+        //   doc id로 덮어쓰기 → 재처리 시 중복 문서 미발생(K3 멱등성). P3의 print()를 대체.
         pageClickCounts
-                .print()
-                .name("print-window-result").uid("print-window-result");
+                .sinkTo(OpenSearchSinkFactory.aggSink(opensearchHost, opensearchPort, opensearchScheme))
+                .name("sink-opensearch-agg").uid("sink-opensearch-agg");
 
         env.execute("flink-user-activity-analytics");
     }
