@@ -92,6 +92,15 @@
       <version>${flink.version}</version>
       <scope>provided</scope>
     </dependency>
+    <!-- W1 로컬 MiniCluster Web UI(http://localhost:8082) 활성화용. provided: Flink dist가
+         제공(fat-jar 미포함). exec:exec@job(classpathScope=compile)에는 포함되어 UI가 뜬다.
+         이 의존성이 classpath에 없으면 createLocalEnvironmentWithWebUI는 UI 없이 조용히 실행됨. -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-runtime-web</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
     <!-- KafkaSource(RecordEmitter 등)가 의존하지만 flink-connector-kafka가 provided로 두어
          전이 해석되지 않음 → 명시적으로 추가 (Flink dist에 포함되므로 provided) -->
     <dependency>

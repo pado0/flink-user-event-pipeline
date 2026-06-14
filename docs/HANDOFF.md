@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-13** (K1·K2·K3 OpenSearch sink 완료 + `W1` Web UI 스텝을 Runtime 앞에 추가 — 계획만, 미구현) / 기준 커밋: `103d7ab` (작업트리 clean; `W1`은 문서에만 반영)
+> 최종 갱신: **2026-06-14** (`W1` 로컬 MiniCluster Flink Web UI 활성화 완료 — `flink-runtime-web` 추가 + `createLocalEnvironmentWithWebUI(8082)`, 실행 중 REST/UI 노출 검증) / 기준 커밋: `d162d31` + W1 미커밋 변경(`pom.xml`·`job`·`CLAUDE.md`·이 문서)
 
 ---
 
@@ -21,8 +21,8 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ✅ 완료 |
 | **P1·P2·P3** | filter-click → keyBy(pageId) → 5min tumbling window → `PageClickCount` | ✅ 완료 |
 | **K1·K2·K3** | `PageClickCount` → JSON 문서(deterministic id) → OpenSearch sink(bulk/retry) + 멱등성 검증 | ✅ 완료 |
-| **W1** | 로컬 MiniCluster Flink Web UI 활성화(`flink-runtime-web` + `createLocalEnvironmentWithWebUI`, port 8082) | ⬜ **다음 차례** |
-| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ |
+| **W1** | 로컬 MiniCluster Flink Web UI 활성화(`flink-runtime-web` + `createLocalEnvironmentWithWebUI`, port 8082) | ✅ 완료 |
+| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ **다음 차례** |
 | R2·R3 | 전 operator name/uid 점검 / E2E 검증 | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
@@ -55,7 +55,7 @@ filnk-practice/
         │   ├── OpenSearchDocs.java                 # K1: PageClickCount → JSON 문서(Jackson) + deterministic doc id
         │   └── OpenSearchSinkFactory.java          # K2: Opensearch2Sink(bulk/retry, at-least-once)
         └── job/
-            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립(현재 source→assign-watermark→filter-click→keyBy→window→sink-opensearch-agg)
+            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립 + env(W1: createLocalEnvironmentWithWebUI, port 8082). source→assign-watermark→filter-click→keyBy→window→sink-opensearch-agg
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -138,6 +138,15 @@ DAG: `… → window-pageclick-5m → sink-opensearch-agg`.
   - **jackson 충돌**: avro 1.11.3이 `jackson-core:2.14.2`를 전이로 끌어와, opensearch 클라이언트가 쓰는 jackson(2.17.0, `StreamConstraintsException`은 2.15+)과 충돌 → 런타임 `NoClassDefFoundError`. **`dependencyManagement`로 `jackson-bom:2.17.0`을 import**해 전 jackson 모듈을 2.17.0으로 고정(depth 무관 override)하여 해결. `jackson-databind`는 compile로 명시.
   - opensearch2 커넥터/jackson은 **compile**(이후 shade 대상) — Flink dist에 없으므로 provided 아님. exec:exec@job(classpathScope=compile)에 자동 포함.
 
+### W1 — 로컬 MiniCluster Flink Web UI 활성화
+`pom.xml`·`job` 두 파일만 수정(다른 코드/DAG 변경 없음). 실 클러스터 제출이 아니라 **로컬 MiniCluster에 Web UI를 부착**하는 방법 A.
+- **`pom.xml`**: `org.apache.flink:flink-runtime-web:1.18.1` 추가, scope **`provided`**(다른 flink 런타임 의존성과 동일 정책 — Flink dist 제공, fat-jar 미포함). `exec:exec@job`은 `classpathScope=compile`이라 provided까지 포함 → UI가 뜬다. ⚠️ 이 의존성이 classpath에 없으면 `createLocalEnvironmentWithWebUI`는 **UI 없이 조용히** 로컬 실행만 한다(에러 아님).
+- **`job/FlinkUserActivityAnalyticsJob.java`**: env 생성을 `getExecutionEnvironment()` → `StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf)`로 교체. `Configuration conf`에 `RestOptions.PORT = 8082` 지정.
+  - ⚠️ **포트 8082** — 기본 8081은 docker-compose Schema Registry가 점유(§6). `WEB_UI_PORT` env로 override 가능(기본 8082).
+  - ⚠️ `createLocalEnvironmentWithWebUI`는 **항상 로컬 MiniCluster**를 띄운다(실 클러스터 `flink run` 제출과는 양립 불가) — 클러스터 제출(fat-jar/shade)은 후순위라 현재는 문제 없음.
+  - ⚠️ **Web UI는 Job 실행 중에만 생존** → 관찰하려면 `BOUNDED=false`(무한 스트리밍)로 띄울 것. `BOUNDED=true`는 end-of-input에서 즉시 종료돼 UI 접속 불가.
+- 검증(§4 W1 커맨드): 무한 스트리밍 실행 → `localhost:8082` HTTP 200, `/jobs/overview` Job RUNNING, `/jobs/{jid}` vertices에 **operator name/uid 라벨 그대로 노출**(`source-user-activity-events → assign-watermark → filter-click` chain, `window-pageclick-5m → sink-opensearch-agg` chain — 가드레일 #4). Ctrl+C(또는 프로세스 kill) 후 8082 닫힘 확인.
+
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
 > ⚠️ 이 머신은 **colima** 런타임. `docker compose`(공백)가 아니라 **`docker-compose`(하이픈)** 사용. (자세한 환경 제약은 §6)
@@ -159,11 +168,32 @@ ls target/generated-sources/avro/com/example/flink/model/avro/UserActivityEvent.
 mvn -q compile exec:java                  # 기본 60건
 mvn -q compile exec:java -Dexec.args=200  # 건수 지정
 
-# (E) Flink Job 실행 — forked JVM. consumer group id 지정됨.
+# (E) Flink Job 실행 — forked JVM. consumer group id 지정됨. W1: 실행 중 Web UI = http://localhost:8082
 #     현재 DAG = filter→keyBy→5min window→OpenSearch sink(user-activity-agg)
-BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → OpenSearch 적재 후 종료
-mvn -q compile exec:exec@job              # 무한 스트리밍(실제 파이프라인). Ctrl+C로 종료
-# env override: OPENSEARCH_HOST(localhost) / OPENSEARCH_PORT(9200) / OPENSEARCH_SCHEME(http)
+BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → OpenSearch 적재 후 종료(UI 즉시 닫힘)
+mvn -q compile exec:exec@job              # 무한 스트리밍(실제 파이프라인 + Web UI 관찰). Ctrl+C로 종료
+# env override: OPENSEARCH_HOST(localhost) / OPENSEARCH_PORT(9200) / OPENSEARCH_SCHEME(http) / WEB_UI_PORT(8082)
+```
+
+### W1 Web UI 검증 커맨드
+```bash
+# 0) 무한 스트리밍으로 Job 기동(백그라운드) — UI는 실행 중에만 생존
+mvn -q compile exec:exec@job &
+
+# 1) Web UI 응답 (기동까지 수 초 소요) → 200
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8082/
+
+# 2) Job 상태 → state RUNNING
+curl -s localhost:8082/jobs/overview
+
+# 3) operator name/uid 라벨 노출 확인(가드레일 #4) — vertices에 DAG 라벨 그대로 표시
+#    예: "source-user-activity-events -> assign-watermark -> filter-click",
+#        "window-pageclick-5m -> sink-opensearch-agg: Writer"
+jid=$(curl -s localhost:8082/jobs/overview | grep -oE '"jid":"[a-f0-9]+"' | head -1 | grep -oE '[a-f0-9]{20,}')
+curl -s "localhost:8082/jobs/$jid" | python3 -c "import sys,json;d=json.load(sys.stdin);[print(v['name']) for v in d['vertices']]"
+
+# 4) 종료(UI도 함께 닫힘) → 이후 curl 8082는 000
+pkill -f 'com.example.flink.job.FlinkUserActivityAnalyticsJob'
 ```
 
 ### P3 윈도우 집계 정합성 검증 커맨드
@@ -235,6 +265,7 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | Flink P1·P2·P3 window | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `PageClickCount{...}` 행, **카운트 합 == 전체 CLICK 수** |
 | Flink K1·K2 sink | `BOUNDED=true … ; curl …/user-activity-agg/_count` | exit 0, 문서 24건, **count 합 == 255(전체 CLICK)**, `_id`=deterministic |
 | Flink K3 멱등성 | BOUNDED job 2회 실행 후 `_count`/`_version` | 문서 수 **24 불변**, `_version` 1→2(덮어쓰기), count 동일 |
+| Flink W1 Web UI | 무한 스트리밍 실행 중 `curl localhost:8082/...` | `/` 200, `/jobs/overview` state RUNNING, vertices에 operator name 라벨 노출; 종료 후 8082 000 |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
@@ -247,20 +278,13 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 > P1·P2·P3 실측: 토픽 총 320건(=기존 120 + 신규 200) 대상 `BOUNDED=true` 실행 → exit 0. 윈도우 결과 24행 출력, pageId 5종(search/product/cart/home/checkout)이 5분 윈도우별로 분리 집계됨. **윈도우 카운트 합 255 == 토픽 전체 CLICK 255건**(avro-console-consumer 분포: CLICK 255 / VIEW 65)으로 정확히 일치 → 필터(P1)·keyBy(P2)·텀블링 윈도우(P3)가 손실/중복 없이 동작. VIEW 65건은 filter-click에서 전량 제외 확인.
 >
 > K1·K2·K3 실측: 토픽 320건 대상 `BOUNDED=true` 실행 → exit 0(BUILD SUCCESS). `user-activity-agg` 인덱스에 **문서 24건**(P3 윈도우 24행과 일치), **count 합계 255.0 == 전체 CLICK 255**, pageId 분포 page-cart/checkout/product/search 각 5 + page-home 4 = 24. 샘플 `_id`=`page-product_1781323500000_1781323800000_CLICK`(deterministic 규칙 정확), `_source`에 pageId/eventType/window(start·end·Iso)/count 필드 정상. **K3 멱등성**: 동일 입력으로 job 재실행 → 문서 수 **24 그대로**(중복 0), 동일 doc의 `_version` 1→2(덮어쓰기 발생), `count`=11 동일, 합계 255 동일 → deterministic id 기반 upsert로 멱등 확인.
+>
+> W1 실측: `mvn -q compile exec:exec@job`(무한 스트리밍) 백그라운드 실행 → `localhost:8082/` **HTTP 200**, `/overview`에 `flink-version 1.18.1` · `jobs-running 1`. `/jobs/overview` Job `flink-user-activity-analytics` **state RUNNING**(tasks 24/24 running). `/jobs/{jid}` vertices에 **operator name/uid 라벨 그대로 노출**(가드레일 #4): `Source: source-user-activity-events -> assign-watermark -> filter-click`(parallelism 12), `window-pageclick-5m -> sink-opensearch-agg: Writer`(parallelism 12) — operator chaining 확인. 프로세스 kill 후 `localhost:8082` → **000**(UI는 Job 실행 중에만 생존, 정상).
 
-## 5. 다음 할 일 — W1 (Web UI: 로컬 MiniCluster 대시보드) → 이후 R1
+## 5. 다음 할 일 — R1 (Runtime: Checkpoint)
 
-> **방법 A**(로컬 MiniCluster에 Web UI 부착)로 결정. 실 클러스터 제출(`start-cluster.sh` + `flink run`)은 fat-jar(shade)가 필요해 후순위.
+> W1(로컬 MiniCluster Web UI)은 **완료**(§3 W1, §4 검증). 실 클러스터 제출(`start-cluster.sh` + `flink run`)은 fat-jar(shade)가 필요해 여전히 후순위 — `createLocalEnvironmentWithWebUI`는 로컬 전용이므로 클러스터 제출 단계에서 env 분기 필요.
 
-CLAUDE.md `W1`: **로컬 MiniCluster Flink Web UI 활성화.**
-- `pom.xml`: `org.apache.flink:flink-runtime-web:1.18.1` 추가, scope **`provided`**(다른 flink 런타임 의존성과 동일 정책 — Flink dist 제공, fat-jar 미포함).
-- `job/FlinkUserActivityAnalyticsJob.java`: env 생성을 `StreamExecutionEnvironment.getExecutionEnvironment()` → `createLocalEnvironmentWithWebUI(conf)`로 교체. `Configuration conf`에 `RestOptions.PORT = 8082` 지정.
-- ⚠️ **포트 8082 사용** — 기본 8081은 docker-compose Schema Registry가 점유.
-- ⚠️ **Web UI는 Job 실행 중에만 생존** → `BOUNDED=false`(무한 스트리밍)로 띄워야 관찰 가능. `BOUNDED=true`는 end-of-input에서 즉시 종료돼 UI 접속 불가.
-- 검증: 무한 스트리밍 실행 후 `http://localhost:8082` → DAG(operator name/uid 라벨 그대로 노출, 가드레일 #4) · operator별 backpressure/numRecordsIn·Out · watermark · (R1 적용 후) checkpoint 확인. 종료는 Ctrl+C.
-- ⚠️ **사용자 요청 전까지 선행 구현 금지.** 한 스텝씩 검증 게이트 통과 후 진행.
-
-### 그다음 — R1 (Runtime: Checkpoint)
 CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
 - `job`의 env 설정에 `env.enableCheckpointing(60_000)` 추가. 추가 고려(CLAUDE.md "Checkpoint / State 설정"): checkpoint timeout, min pause between checkpoints, tolerable checkpoint failure number, externalized checkpoint **retain on cancellation**, state backend(메모리→RocksDB) 교체 여지.
 - Kafka offset은 Flink checkpoint와 함께 관리(별도 auto-commit 의존 X) — KafkaSource는 checkpoint 시 offset을 함께 스냅샷.
@@ -290,8 +314,9 @@ CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
   - `0f8609e` `docs: HANDOFF Git 섹션을 origin 동기화 상태로 정정`
   - `103d7ab` `feat: K1·K2·K3 OpenSearch sink (JSON 문서 + deterministic id + bulk/retry + 멱등)`
   - `0f8aeef` `docs: HANDOFF Git 섹션을 103d7ab(K1·K2·K3) 커밋·푸시 반영으로 정정`
-  - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가` ← 현재 HEAD
-- **`origin/main`과 동기화 완료** (HEAD = `d162d31`, 작업트리 clean). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. `d162d31` 변경: `CLAUDE.md`/`docs/HANDOFF.md`에 W1 Web UI 스텝 추가 — 문서만, 코드 미변경.)
+  - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가` ← 현재 HEAD(`origin/main`)
+- **`origin/main`과 동기화 완료** (HEAD = `d162d31`). S1~K3 전부 푸시됨. (`103d7ab` 변경: `pom.xml` opensearch2 2.0.0-1.18 + jackson-bom + jackson-databind, `job`의 sink 연결, 신규 `sink/OpenSearchDocs.java`·`sink/OpenSearchSinkFactory.java`, `CLAUDE.md`/`docs/HANDOFF.md` 갱신. `d162d31` 변경: `CLAUDE.md`/`docs/HANDOFF.md`에 W1 Web UI 스텝 추가 — 문서만, 코드 미변경.)
+- ⚠️ **W1 구현은 아직 미커밋**(작업트리 변경 있음). 변경 파일: `pom.xml`(flink-runtime-web provided 추가), `job/FlinkUserActivityAnalyticsJob.java`(`createLocalEnvironmentWithWebUI`+`RestOptions.PORT 8082`+`WEB_UI_PORT` env), `CLAUDE.md`(W1 체크 ✅), `docs/HANDOFF.md`(이 문서). 커밋 메시지 예: `feat: W1 로컬 MiniCluster Flink Web UI(8082) 활성화`.
 
 ## 8. 참고
 
