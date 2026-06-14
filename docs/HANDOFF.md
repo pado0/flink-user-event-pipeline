@@ -1,7 +1,7 @@
-₩₩# HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
+# HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-12** (S3 완료) / 기준 커밋: `672140f` (+ S3 미커밋 작업트리)
+> 최종 갱신: **2026-06-13** (S4 완료) / 기준 커밋: `03ea38b` (S3) (+ S4 미커밋 작업트리)
 
 ---
 
@@ -17,8 +17,9 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **S1** | `user-activity-event.avsc` 정의 → `UserActivityEvent` codegen | ✅ 완료 |
 | **S2** | docker-compose 기동(Kafka+SR+OpenSearch+Dashboards) + 토픽 생성 | ✅ 완료 |
 | **S3** | Avro producer로 샘플 이벤트 적재 | ✅ 완료 |
-| **S4** | KafkaSource + Confluent Avro deser → `print()` | ⬜ **다음 차례** |
-| S5~ | Watermark / Filter / Window / Sink / Checkpoint | ⬜ |
+| **S4** | KafkaSource + Confluent Avro deser → `print()` | ✅ 완료 |
+| **S5** | Event Time / Watermark 부여(30s out-of-orderness) | ⬜ **다음 차례** |
+| P1~ | Filter / keyBy / Window / Sink / Checkpoint | ⬜ |
 | 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
 
 > **작업 규칙(중요):** 사용자는 **한 스텝씩만** 구현하고 멈추길 원함. 검증 게이트 통과 후 다음 진행. 임의로 다음 스텝 선행 금지.
@@ -29,15 +30,20 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 filnk-practice/
 ├── CLAUDE.md                          # 프로젝트 스펙·가드레일 (SSOT)
 ├── docker-compose.yml                 # S2: Kafka(KRaft)+SR+OpenSearch 2.11.1+Dashboards
-├── pom.xml                            # S1 avro codegen + S3 producer 의존성(kafka-clients, kafka-avro-serializer, exec plugin)
+├── pom.xml                            # S1 codegen + S3 producer + S4 Flink 의존성, exec plugin(producer/job)
 ├── .gitignore                        # target/, .idea/, *.iml, .DS_Store, *.log
 ├── docs/
 │   └── HANDOFF.md                     # (이 문서)
 └── src/main/
     ├── avro/
     │   └── user-activity-event.avsc   # codegen source → UserActivityEvent
-    └── java/com/example/flink/producer/
-        └── SampleEventProducer.java   # S3: 샘플 Avro 이벤트 적재 producer
+    └── java/com/example/flink/
+        ├── producer/
+        │   └── SampleEventProducer.java          # S3: 샘플 Avro 이벤트 적재 producer
+        ├── source/
+        │   └── UserActivityKafkaSourceFactory.java # S4: KafkaSource + Confluent Avro registry deser
+        └── job/
+            └── FlinkUserActivityAnalyticsJob.java  # S4: DAG 조립(현재 source→print)
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -65,6 +71,18 @@ filnk-practice/
 - `pom.xml`: `kafka-clients:3.6.1`, `io.confluent:kafka-avro-serializer:7.6.1`, Confluent 레포, `exec-maven-plugin`(mainClass 지정) 추가.
 - ⚠️ slf4j 바인딩은 일부러 미포함(NOP) → 실행 시 `SLF4J: ... NOP logger` 경고는 정상. producer는 자체 `System.out`으로 결과 출력.
 
+### S4 — Flink KafkaSource + Avro registry deser → print()
+- `source/UserActivityKafkaSourceFactory.java`: `KafkaSource<UserActivityEvent>` 빌더.
+  - deser = `ConfluentRegistryAvroDeserializationSchema.forSpecific(UserActivityEvent.class, registryUrl)`
+    (메시지의 schema id로 Registry에서 writer 스키마 조회 → SpecificRecord 디코드).
+  - `setGroupId("flink-user-activity-analytics")`(검증 요건), `setStartingOffsets(earliest)`.
+  - `bounded` 플래그: true면 `setBounded(latest)` → 시작 시점까지만 읽고 종료(검증/배치용), 기본 false=무한 스트리밍.
+- `job/FlinkUserActivityAnalyticsJob.java`: `env.fromSource(source, noWatermarks, "source-user-activity-events")` → `.print()`.
+  - 가드레일대로 operator에 `.name()`+`.uid()` 부여(`source-user-activity-events`, `print-events`). Watermark는 S5에서.
+  - env override: `BOOTSTRAP_SERVERS` / `SCHEMA_REGISTRY_URL` / `KAFKA_GROUP_ID` / `BOUNDED`.
+- `pom.xml`: `flink-streaming-java`·`flink-clients`·`flink-connector-base`(**provided**), `flink-connector-kafka:3.1.0-1.18`·`flink-avro`·`flink-avro-confluent-registry`(**compile**, 이후 shade 대상).
+  - ⚠️ **실행 함정(해결됨)**: Flink는 provided라 (1) `exec`는 `classpathScope=compile`로 provided까지 포함해야 하고, (2) `flink-connector-kafka`의 provided 전이의존이 누락되어 `flink-connector-base`를 명시 추가했으며, (3) `exec:java`(동일 JVM)는 MiniCluster classloader 문제로 `ExecutionConfig ClassNotFound`가 나므로 **Flink Job은 `exec:exec`(forked JVM)** 로 실행한다. → producer=`exec:java`, job=`exec:exec@job`.
+
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
 > ⚠️ 이 머신은 **colima** 런타임. `docker compose`(공백)가 아니라 **`docker-compose`(하이픈)** 사용. (자세한 환경 제약은 §6)
@@ -85,6 +103,10 @@ ls target/generated-sources/avro/com/example/flink/model/avro/UserActivityEvent.
 # (D) 샘플 이벤트 적재 (S3) — compile 시 codegen도 함께 수행됨
 mvn -q compile exec:java                  # 기본 60건
 mvn -q compile exec:java -Dexec.args=200  # 건수 지정
+
+# (E) Flink Job 실행 (S4) — forked JVM. consumer group id 지정됨
+BOUNDED=true mvn -q compile exec:exec@job # 시작 시점까지 읽고 종료(검증용) → print 출력
+mvn -q compile exec:exec@job              # 무한 스트리밍(실제 파이프라인). Ctrl+C로 종료
 ```
 
 ### S3 적재 내용 확인 커맨드
@@ -113,16 +135,27 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | 토픽 | `docker-compose exec kafka kafka-topics --list --bootstrap-server localhost:9092` | `user-activity-events` (Partitions 3) |
 | Schema Registry (S3 후) | `curl -s localhost:8081/subjects` | `["user-activity-events-value"]` (S3 적재로 등록됨) |
 | 토픽 메시지 (S3 후) | `kafka.tools.GetOffsetShell ... --topic user-activity-events` | offset 합 = 적재 건수 (예: 60) |
+| Flink S4 read | `BOUNDED=true mvn -q compile exec:exec@job` | exit 0, `UserActivityEvent` JSON이 적재 건수만큼 stdout 출력 |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
 > S3 실측: 60건 적재 → subject `user-activity-events-value`(version 1, id 1) 등록, 파티션 분포 p0=0 / p1=35 / p2=25 (key=pageId 해시로 5개 키가 2개 파티션에 분산), avro-console-consumer로 CLICK/VIEW·sessionId(null 포함) 정상 디코드.
+>
+> S4 실측: `BOUNDED=true` 실행으로 60건이 SpecificRecord로 역직렬화되어 print 출력(`9>`/`10>` prefix=source 병렬도), eventType 47 CLICK/13 VIEW, sessionId null·값 모두 정상. exit 0.
 
-## 5. 다음 할 일 — S4
+## 5. 다음 할 일 — S5
 
-CLAUDE.md `S4`: **KafkaSource + `ConfluentRegistryAvroDeserializationSchema.forSpecific(UserActivityEvent.class, ...)` 로 읽기 → `print()`.**
-- 검증 게이트: 콘솔에 이벤트 출력, consumer group id 지정.
-- 필요 작업(예상): `pom.xml`에 Flink 런타임(`flink-streaming-java`, `provided`) + `flink-connector-kafka` + `flink-avro-confluent-registry` 추가, `source/UserActivityKafkaSourceFactory` 작성, 간단한 `main`에서 `env.fromSource(...).print()`.
+CLAUDE.md `S5`: **Event Time / Watermark 부여 `[assign-watermark]` (30s out-of-orderness).**
+- 현재 `fromSource(...)`에 `WatermarkStrategy.noWatermarks()`를 넘기고 있음 → 이를 교체.
+  ```java
+  WatermarkStrategy
+    .<UserActivityEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((e, ts) -> e.getEventTime());
+  ```
+- 적용 위치 선택지: (a) `env.fromSource(source, <위 strategy>, "source-...")`에 직접, 또는
+  (b) source 뒤 `.assignTimestampsAndWatermarks(...)` operator로 분리(`[assign-watermark]` 라벨/uid 부여).
+  → DAG 라벨이 `assign-watermark`로 따로 있으니 (b)가 가드레일 네이밍과 맞음.
+- 검증 게이트(예상): watermark가 실제로 진행되는지(예: 간단한 timestamp 출력/이후 window에서 확인).
 - ⚠️ **사용자 요청 전까지 선행 구현 금지.** (한 스텝씩)
 
 ## 6. 환경 제약 (Apple Silicon + colima) — 반드시 숙지
@@ -139,7 +172,8 @@ CLAUDE.md `S4`: **KafkaSource + `ConfluentRegistryAvroDeserializationSchema.forS
 
 - 원격: `git@github.com:pado0/flink-user-event-pipeline.git` (SSH), `origin/main` 추적 설정 완료.
 - 커밋 `672140f` `chore: 프로젝트 스캐폴딩 (S1 Avro 스키마 + S2 로컬 인프라)` 푸시 완료.
-- **S3 작업은 아직 미커밋** (작업트리): `pom.xml`(producer 의존성), `src/.../SampleEventProducer.java`, `CLAUDE.md`/`HANDOFF.md` 문서 갱신. → 다음 커밋 대상.
+- 커밋 `03ea38b` `feat: S3 Avro 샘플 이벤트 producer 적재` — **로컬 커밋만, 미푸시**.
+- **S4 작업은 아직 미커밋** (작업트리): `pom.xml`(Flink 의존성·exec job 실행), `src/.../source/UserActivityKafkaSourceFactory.java`, `src/.../job/FlinkUserActivityAnalyticsJob.java`, `CLAUDE.md`/`HANDOFF.md` 갱신. → 다음 커밋 대상.
 
 ## 8. 참고
 

@@ -152,7 +152,7 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `S1` `user-activity-event.avsc` 정의 → `mvn generate-sources`로 `UserActivityEvent` codegen *(검증: `target/generated-sources`에 클래스 생성)*
 - [x] `S2` docker-compose 기동(Kafka+Schema Registry+OpenSearch), 토픽 생성 *(검증: `kafka-topics --list`, registry `/subjects` 응답)*
 - [x] `S3` Avro producer로 샘플 이벤트 적재 *(검증: subject `user-activity-events-value` 등록 + 토픽에 메시지)*
-- [ ] `S4` KafkaSource + `ConfluentRegistryAvroDeserializationSchema.forSpecific(...)` 로 읽기 → `print()` *(검증: 콘솔 출력, consumer group id 지정)*
+- [x] `S4` KafkaSource + `ConfluentRegistryAvroDeserializationSchema.forSpecific(...)` 로 읽기 → `print()` *(검증: 콘솔 출력, consumer group id 지정)*
 - [ ] `S5` Event Time / Watermark 부여(30s out-of-orderness) `[assign-watermark]`
 
 ### 1차 — Process

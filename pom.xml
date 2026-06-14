@@ -12,7 +12,8 @@
   <!--
     S1: Avro .avsc → UserActivityEvent(SpecificRecord) codegen.
     S3: 샘플 이벤트 적재용 Kafka producer + Confluent KafkaAvroSerializer(Schema Registry 연동).
-    Flink / OpenSearch 런타임 의존성과 maven-shade-plugin(fat-jar)은 이후 스텝(S4~)에서 추가한다.
+    S4: Flink KafkaSource + Confluent Avro registry deser → print().
+    OpenSearch sink / maven-shade-plugin(fat-jar)은 이후 스텝에서 추가한다.
   -->
 
   <properties>
@@ -22,6 +23,9 @@
     <!-- docker-compose의 cp-kafka / cp-schema-registry 7.6.1 (Apache Kafka 3.6.1)에 맞춤 -->
     <kafka.version>3.6.1</kafka.version>
     <confluent.version>7.6.1</confluent.version>
+    <flink.version>1.18.1</flink.version>
+    <!-- 외부화된 Kafka 커넥터 버전 표기: <connector>-<flink minor> -->
+    <flink.connector.kafka.version>3.1.0-1.18</flink.connector.kafka.version>
   </properties>
 
   <!-- Confluent KafkaAvroSerializer / schema-registry-client 해석용 레포 -->
@@ -50,6 +54,46 @@
       <artifactId>kafka-avro-serializer</artifactId>
       <version>${confluent.version}</version>
     </dependency>
+
+    <!-- S4 Flink 런타임: provided (클러스터/로컬 MiniCluster가 제공, fat-jar 미포함).
+         exec:java는 compile classpath(=provided 포함)로 돌아가므로 로컬 실행도 가능. -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- KafkaSource(RecordEmitter 등)가 의존하지만 flink-connector-kafka가 provided로 두어
+         전이 해석되지 않음 → 명시적으로 추가 (Flink dist에 포함되므로 provided) -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-base</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- S4 커넥터/포맷: compile (이후 fat-jar shade 포함 대상) -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>${flink.connector.kafka.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-avro</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-avro-confluent-registry</artifactId>
+      <version>${flink.version}</version>
+    </dependency>
   </dependencies>
 
   <build>
@@ -76,14 +120,39 @@
         </executions>
       </plugin>
 
-      <!-- S3: 샘플 이벤트 producer 실행용 (mvn -q compile exec:java [-Dexec.args=200]) -->
+      <!--
+        로컬 실행 (Flink는 provided라 classpathScope=compile로 provided까지 classpath에 포함):
+          - S3 producer (exec:java, 동일 JVM): mvn -q compile exec:java [-Dexec.args=200]
+          - Flink Job   (exec:exec, forked JVM): mvn -q compile exec:exec@job
+        Flink Job은 MiniCluster classloader 문제로 동일 JVM(exec:java)에선 ExecutionConfig
+        ClassNotFound가 나므로 별도 JVM(exec:exec)으로 띄운다.
+      -->
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.1.1</version>
         <configuration>
+          <!-- 기본 exec:java 대상 = S3 producer -->
           <mainClass>com.example.flink.producer.SampleEventProducer</mainClass>
+          <classpathScope>compile</classpathScope>
         </configuration>
+        <executions>
+          <execution>
+            <id>job</id>
+            <goals>
+              <goal>exec</goal>
+            </goals>
+            <configuration>
+              <executable>java</executable>
+              <classpathScope>compile</classpathScope>
+              <arguments>
+                <argument>-classpath</argument>
+                <classpath/>
+                <argument>com.example.flink.job.FlinkUserActivityAnalyticsJob</argument>
+              </arguments>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
