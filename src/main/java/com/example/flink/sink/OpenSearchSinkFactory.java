@@ -9,6 +9,8 @@ import org.apache.flink.connector.opensearch.sink.OpensearchEmitter;
 import org.apache.http.HttpHost;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.common.xcontent.XContentType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * K2 — {@link PageClickCount} 스트림을 OpenSearch {@code user-activity-agg} 인덱스로 적재하는
@@ -29,6 +31,8 @@ import org.opensearch.common.xcontent.XContentType;
  */
 public final class OpenSearchSinkFactory {
 
+    private static final Logger LOG = LoggerFactory.getLogger(OpenSearchSinkFactory.class);
+
     private OpenSearchSinkFactory() {
     }
 
@@ -41,10 +45,14 @@ public final class OpenSearchSinkFactory {
         // PageClickCount → IndexRequest(JSON 문서 + deterministic id). emit은 checked 예외를
         // 못 던지므로 JSON 직렬화 예외는 OpenSearchDocs 내부에서 unchecked로 변환된다.
         // emitter를 명시 타입 변수로 두어 setEmitter의 제네릭 추론(? super T)을 PageClickCount로 고정.
-        OpensearchEmitter<PageClickCount> emitter = (pageClickCount, ctx, indexer) ->
-                indexer.add(new IndexRequest(OpenSearchDocs.AGG_INDEX)
-                        .id(OpenSearchDocs.aggDocId(pageClickCount))
-                        .source(OpenSearchDocs.aggDocJson(pageClickCount), XContentType.JSON));
+        OpensearchEmitter<PageClickCount> emitter = (pageClickCount, ctx, indexer) -> {
+            String docId = OpenSearchDocs.aggDocId(pageClickCount);
+            LOG.debug("sink-opensearch-agg index: index={} id={} count={}",
+                    OpenSearchDocs.AGG_INDEX, docId, pageClickCount.getCount());
+            indexer.add(new IndexRequest(OpenSearchDocs.AGG_INDEX)
+                    .id(docId)
+                    .source(OpenSearchDocs.aggDocJson(pageClickCount), XContentType.JSON));
+        };
 
         return new Opensearch2SinkBuilder<PageClickCount>()
                 .setHosts(new HttpHost(host, port, scheme))

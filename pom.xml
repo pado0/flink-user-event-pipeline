@@ -32,6 +32,8 @@
     <flink.connector.opensearch.version>2.0.0-1.18</flink.connector.opensearch.version>
     <!-- sink JSON 직렬화 전용. opensearch-x-content 2.13.0이 쓰는 jackson과 동일 버전으로 정렬. -->
     <jackson.version>2.17.0</jackson.version>
+    <!-- 로깅: slf4j(1.7.x) → log4j2 backend. 전이로 들어온 log4j-api 2.21.0과 버전 정렬. -->
+    <log4j.version>2.21.0</log4j.version>
   </properties>
 
   <!-- Confluent KafkaAvroSerializer / schema-registry-client 해석용 레포 -->
@@ -107,6 +109,24 @@
       <groupId>org.apache.flink</groupId>
       <artifactId>flink-connector-base</artifactId>
       <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- 로깅 backend: slf4j(1.7.x) → log4j2 바인딩 + log4j2 코어.
+         파이프라인 관측용 로그가 실제로 출력되려면 바인딩 + core가 필요(미존재 시 NOP).
+         slf4j-api가 1.7.36이므로 log4j-slf4j-impl(1.7 bridge) 사용 — slf4j2-impl(2.x용) 아님.
+         scope=provided: Flink dist(/lib)가 log4j2 제공 → fat-jar 미포함(클러스터 충돌 방지).
+         exec:exec@job(classpathScope=compile)·IntelliJ provided 포함 실행에는 포함되어 출력됨. -->
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-slf4j-impl</artifactId>
+      <version>${log4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.logging.log4j</groupId>
+      <artifactId>log4j-core</artifactId>
+      <version>${log4j.version}</version>
       <scope>provided</scope>
     </dependency>
 

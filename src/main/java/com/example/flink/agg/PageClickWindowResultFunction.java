@@ -4,6 +4,8 @@ import com.example.flink.model.PageClickCount;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * P3 — 증분 집계된 카운트(Long)에 윈도우 메타데이터(key=pageId, windowStart/End)를 부착해
@@ -20,6 +22,8 @@ import org.apache.flink.util.Collector;
 public final class PageClickWindowResultFunction
         extends ProcessWindowFunction<Long, PageClickCount, String, TimeWindow> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(PageClickWindowResultFunction.class);
+
     @Override
     public void process(
             String pageId,
@@ -29,6 +33,8 @@ public final class PageClickWindowResultFunction
 
         long count = counts.iterator().next(); // 증분 집계라 원소는 항상 1개
         TimeWindow window = context.window();
-        out.collect(new PageClickCount(pageId, window.getStart(), window.getEnd(), count));
+        PageClickCount result = new PageClickCount(pageId, window.getStart(), window.getEnd(), count);
+        LOG.info("window-pageclick-5m fired: {}", result);
+        out.collect(result);
     }
 }

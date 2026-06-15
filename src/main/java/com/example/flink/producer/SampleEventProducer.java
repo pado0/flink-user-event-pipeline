@@ -8,6 +8,8 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Properties;
@@ -33,6 +35,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * 엔드포인트는 환경변수 {@code BOOTSTRAP_SERVERS} / {@code SCHEMA_REGISTRY_URL}로 override 가능.
  */
 public final class SampleEventProducer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(SampleEventProducer.class);
 
     private static final String TOPIC = "user-activity-events";
 
@@ -60,7 +64,7 @@ public final class SampleEventProducer {
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.CLIENT_ID_CONFIG, "sample-event-producer");
 
-        System.out.printf("[producer] bootstrap=%s registry=%s topic=%s count=%d%n",
+        LOG.info("producer 시작: bootstrap={} registry={} topic={} count={}",
                 bootstrap, registry, TOPIC, count);
 
         long now = System.currentTimeMillis();
@@ -76,7 +80,7 @@ public final class SampleEventProducer {
                 producer.send(record, (metadata, ex) -> {
                     if (ex != null) {
                         fail.incrementAndGet();
-                        System.err.println("[producer] send failed: " + ex);
+                        LOG.error("producer send 실패", ex);
                     } else {
                         ok.incrementAndGet();
                     }
@@ -85,7 +89,7 @@ public final class SampleEventProducer {
             producer.flush();
         }
 
-        System.out.printf("[producer] done. sent=%d failed=%d%n", ok.get(), fail.get());
+        LOG.info("producer 완료: sent={} failed={}", ok.get(), fail.get());
         if (fail.get() > 0) {
             System.exit(1);
         }

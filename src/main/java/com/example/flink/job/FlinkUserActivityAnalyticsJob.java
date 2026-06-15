@@ -16,6 +16,8 @@ import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Flink user-activity 분석 파이프라인 Job (DAG 조립 + env 설정).
@@ -49,6 +51,8 @@ import org.apache.flink.streaming.api.windowing.time.Time;
  */
 public final class FlinkUserActivityAnalyticsJob {
 
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkUserActivityAnalyticsJob.class);
+
     private static final String DEFAULT_GROUP_ID = "flink-user-activity-analytics";
 
     /** W1: 로컬 MiniCluster Web UI 기본 포트. 8081은 Schema Registry가 점유하므로 8082 사용. */
@@ -76,6 +80,9 @@ public final class FlinkUserActivityAnalyticsJob {
         String opensearchScheme = getenvOr("OPENSEARCH_SCHEME", "http");
         int webUiPort = Integer.parseInt(getenvOr("WEB_UI_PORT", String.valueOf(DEFAULT_WEB_UI_PORT)));
 
+        LOG.info("Job 설정: bootstrap={} registry={} group={} bounded={} opensearch={}://{}:{} webUiPort={}",
+                bootstrap, registry, groupId, bounded, opensearchScheme, opensearchHost, opensearchPort, webUiPort);
+
         // W1 [Web UI]: 로컬 MiniCluster에 REST/Web UI를 부착해 DAG·backpressure·watermark를 관찰.
         //   createLocalEnvironmentWithWebUI는 항상 로컬 MiniCluster를 띄운다(클러스터 제출은 후순위).
         //   UI는 Job 실행 중에만 생존 → 관찰하려면 BOUNDED=false(무한 스트리밍)로 실행할 것.
@@ -98,7 +105,12 @@ public final class FlinkUserActivityAnalyticsJob {
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy
                                 .<UserActivityEvent>forBoundedOutOfOrderness(MAX_OUT_OF_ORDERNESS)
-                                .withTimestampAssigner((event, recordTimestamp) -> event.getEventTime()))
+                                .withTimestampAssigner((event, recordTimestamp) -> {
+                                    long eventTime = event.getEventTime();
+                                    LOG.debug("assign-watermark: eventId={} page={} type={} eventTime={}",
+                                            event.getEventId(), event.getPageId(), event.getEventType(), eventTime);
+                                    return eventTime;
+                                }))
                 .name("assign-watermark").uid("assign-watermark");
 
         // P1 [filter-click]: eventType == CLICK 만 통과 (VIEW 등은 집계 대상 아님).
@@ -121,6 +133,11 @@ public final class FlinkUserActivityAnalyticsJob {
         pageClickCounts
                 .sinkTo(OpenSearchSinkFactory.aggSink(opensearchHost, opensearchPort, opensearchScheme))
                 .name("sink-opensearch-agg").uid("sink-opensearch-agg");
+
+        LOG.info("DAG 조립 완료: source-user-activity-events → assign-watermark → filter-click "
+                + "→ keyBy(pageId) → window-pageclick-5m → sink-opensearch-agg | Web UI: http://localhost:{}",
+                webUiPort);
+        LOG.info("Job 제출: 'flink-user-activity-analytics' (bounded={})", bounded);
 
         env.execute("flink-user-activity-analytics");
     }

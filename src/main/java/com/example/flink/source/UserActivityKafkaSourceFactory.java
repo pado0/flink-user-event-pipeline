@@ -5,6 +5,8 @@ import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.KafkaSourceBuilder;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.formats.avro.registry.confluent.ConfluentRegistryAvroDeserializationSchema;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * S4 — Kafka {@code user-activity-events} 토픽을 Confluent Schema Registry 기반 Avro
@@ -18,6 +20,8 @@ import org.apache.flink.formats.avro.registry.confluent.ConfluentRegistryAvroDes
  * </ul>
  */
 public final class UserActivityKafkaSourceFactory {
+
+    private static final Logger LOG = LoggerFactory.getLogger(UserActivityKafkaSourceFactory.class);
 
     public static final String TOPIC = "user-activity-events";
 
@@ -33,6 +37,9 @@ public final class UserActivityKafkaSourceFactory {
      */
     public static KafkaSource<UserActivityEvent> create(
             String bootstrapServers, String schemaRegistryUrl, String groupId, boolean bounded) {
+
+        LOG.info("KafkaSource 생성: topic={} bootstrap={} registry={} group={} startingOffsets=earliest bounded={}",
+                TOPIC, bootstrapServers, schemaRegistryUrl, groupId, bounded);
 
         KafkaSourceBuilder<UserActivityEvent> builder = KafkaSource.<UserActivityEvent>builder()
                 .setBootstrapServers(bootstrapServers)
