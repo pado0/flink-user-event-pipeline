@@ -174,16 +174,16 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `R3` E2E 검증(produce → agg 인덱스까지 흐름) *(BOUNDED: agg 34문서, count 합 401 == 전체 CLICK 401)*
 
 ### 2차 — Process (Top N)
-- [ ] `keyBy(windowEnd)` → `TopNPagesFunction`(KeyedProcessFunction, 상위 N만 bounded 유지, 계산 후 state clear) → `TopPageResult` `[topn-pages]`
-- [ ] OpenSearch `user-activity-topn` 저장 `[sink-opensearch-topn]`
+- [x] `keyBy(windowEnd)` → `TopNPagesFunction`(KeyedProcessFunction, 상위 N만 bounded 유지, 계산 후 state clear) → `TopPageResult` `[topn-pages]` *(MapState(pageId→count)+ValueState(windowStart/emitted), windowEnd+1 이벤트타임 타이머 발화 시 (count desc, pageId asc) 정렬 후 상위 N emit·state clear. emitted 플래그로 late 재발화 무시. 검증: topn 3문서, rank가 agg 상위 3와 일치, 동점 시 pageId 사전순 tie-break)*
+- [x] OpenSearch `user-activity-topn` 저장 `[sink-opensearch-topn]` *(doc id `windowStart_windowEnd_rank_pageId`, 멱등 재실행 `_version`만 증가)*
 
 ### 2차 — 견고성 (DLQ / late)
-- [ ] Avro 역직렬화 실패 / 스키마 불일치 → side output(DLQ)
-- [ ] late event 처리(allowedLateness / lateData side output)
+- [x] Avro 역직렬화 실패 / 스키마 불일치 → side output(DLQ) *(source는 raw byte[]만 읽고 `AvroDeserSplitter`(ProcessFunction)가 `forSpecific`을 try/catch — **역직렬화만** 감쌈, `out.collect` 하류 예외는 전파. 실패는 `DlqRecord`(원본 bytes+에러)로 side output → `user-activity-dlq`(doc id=SHA-256). 검증: poison 5건 "Magic number does not match" → DLQ 5문서, 파이프라인 무중단)*
+- [x] late event 처리(allowedLateness / lateData side output) *(window에 `allowedLateness(60s)` + `sideOutputLateData` → `user-activity-late`. assign-watermark에 `withIdleness`로 R3 이월 idle-subtask 워터마크 정체 수정 → 스트리밍에서도 윈도우 firing. 검증: backdate 이벤트 → late 22문서)*
 
 ### 2차 — 운영
-- [ ] State TTL 적용
-- [ ] backpressure 테스트(sink 지연 주입) / TaskManager 장애 복구(checkpoint restore)
+- [x] State TTL 적용 *(TopN MapState/ValueState에 `StateTtlConfig`(기본 1h, OnCreateAndWrite/NeverReturnExpired) — 타이머 미발화 키 누수 안전망)*
+- [x] backpressure 테스트(sink 지연 주입) / TaskManager 장애 복구(checkpoint restore) *(backpressure: `SINK_DELAY_MS`로 agg sink emit 지연 주입(검증: 500ms 간격 throttle 확인. 단 windowing이 sink 앞 볼륨을 줄이고 sink가 window에 chain되어 BP 지표는 약함). 복구: `RestartStrategyOptions` fixed-delay(3회/5s) + `FaultInjectionMapper`(`FAIL_AFTER` 전역 카운터로 1회 의도적 throw). 검증: fault 발생 → ExecutionGraph 재배포(restart) → 멱등 sink로 정상 결과 복구(agg 합/topn/dlq 정상))*
 
 > Top N · DLQ · TTL을 1차에 섞지 않는다.
 

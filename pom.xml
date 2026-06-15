@@ -203,6 +203,19 @@
           <classpathScope>compile</classpathScope>
         </configuration>
         <executions>
+          <!-- 2차 DLQ 테스트용 producer (exec:java, 동일 JVM). 플러그인 기본 mainClass(SampleEventProducer)를
+               하드코딩 config가 덮어버려 -Dexec.mainClass override가 안 먹으므로 별도 execution으로 둔다.
+               실행: mvn -q compile exec:java@poison [-Dexec.args=10] -->
+          <execution>
+            <id>poison</id>
+            <goals>
+              <goal>java</goal>
+            </goals>
+            <configuration>
+              <mainClass>com.example.flink.producer.PoisonEventProducer</mainClass>
+              <classpathScope>compile</classpathScope>
+            </configuration>
+          </execution>
           <execution>
             <id>job</id>
             <goals>

@@ -2,56 +2,70 @@ package com.example.flink.job;
 
 import com.example.flink.agg.PageClickCountAggregator;
 import com.example.flink.agg.PageClickWindowResultFunction;
+import com.example.flink.model.DlqRecord;
 import com.example.flink.model.PageClickCount;
+import com.example.flink.model.TopPageResult;
 import com.example.flink.model.avro.UserActivityEvent;
+import com.example.flink.ops.FaultInjectionMapper;
 import com.example.flink.sink.OpenSearchSinkFactory;
+import com.example.flink.source.AvroDeserSplitter;
 import com.example.flink.source.UserActivityKafkaSourceFactory;
+import com.example.flink.topn.TopNPagesFunction;
 import java.time.Duration;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.time.Time;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestOptions;
+import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
-import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.util.OutputTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Flink user-activity 분석 파이프라인 Job (DAG 조립 + env 설정).
  *
- * <p>현재 구현 단계: <b>R1·R2·R3</b> — Event Time 부여한 스트림을 CLICK 필터 → pageId keyBy →
- * 5분 tumbling window로 집계({@link PageClickCount})한 뒤, JSON 문서(deterministic id)로 매핑해
- * OpenSearch {@code user-activity-agg} 인덱스에 bulk/retry로 적재한다. R1에서 60초 checkpoint
- * (Kafka offset 연동, retain-on-cancellation)를 활성화했고, R2로 전 operator에 name/uid를 부여했다.
+ * <p>현재 구현 단계: <b>2차 전체</b> — 1차(S1~R3) 위에 Top N · DLQ · late · State TTL · 견고성을 얹었다.
  *
  * <p>현재 DAG:
  * <pre>
- *   source-user-activity-events  → assign-watermark → filter-click → keyBy(pageId)
- *   (Kafka + Avro deser)           (Event Time, 30s    (eventType
- *                                   out-of-orderness)   == CLICK)
- *       → window-pageclick-5m  → sink-opensearch-agg
- *         (5min tumbling,        (PageClickCount → JSON 문서 + deterministic id
- *          count → PageClickCount) → OpenSearch bulk/retry, 멱등 upsert)
+ *   source-user-activity-events (raw bytes)
+ *     → split-deser (Avro deser, 실패 → DLQ side output)
+ *         ├─(DLQ)──────────────────────────────────→ sink-opensearch-dlq
+ *         └─(main) → assign-watermark (Event Time, 30s OoO, withIdleness)
+ *                     → filter-click (eventType==CLICK)
+ *                     → [fault-injection]  (선택: FAIL_AFTER>0일 때만)
+ *                     → keyBy(pageId)
+ *                     → window-pageclick-5m (5min tumbling, allowedLateness, late side output)
+ *                         ├─(late)─────────────────→ sink-opensearch-late
+ *                         ├─(main) ───────────────→ sink-opensearch-agg  (선택: SINK_DELAY_MS로 지연)
+ *                         └─(main) → keyBy(windowEnd)
+ *                                     → topn-pages (KeyedProcessFunction, 상위 N, State TTL, clear)
+ *                                     → sink-opensearch-topn
  * </pre>
  *
  * <p>실행(로컬 MiniCluster + Web UI):
  * <pre>
  *   mvn -q compile exec:exec@job                 # 무한 스트리밍 → http://localhost:8082 에서 관찰
- *   BOUNDED=true mvn -q compile exec:exec@job    # 시작 시점까지만 읽고 종료(검증용; UI는 즉시 닫힘)
+ *   BOUNDED=true mvn -q compile exec:exec@job    # 시작 시점까지만 읽고 종료(E2E 검증; UI는 즉시 닫힘)
+ *   # DLQ 테스트:    mvn -q compile exec:java -Dexec.mainClass=...PoisonEventProducer
+ *   # backpressure:  SINK_DELAY_MS=200 mvn -q compile exec:exec@job
+ *   # 복구 데모:      FAIL_AFTER=300 mvn -q compile exec:exec@job
  * </pre>
- * (W1) env를 {@link StreamExecutionEnvironment#createLocalEnvironmentWithWebUI(Configuration)}로
- * 띄워 로컬 MiniCluster Web UI(기본 포트 8082)를 활성화한다 — DAG·operator backpressure·watermark
- * 관찰용. UI는 Job 실행 중에만 생존하므로 무한 스트리밍({@code BOUNDED=false})으로 띄워야 한다.
  *
- * <p>엔드포인트/그룹은 환경변수 {@code BOOTSTRAP_SERVERS} / {@code SCHEMA_REGISTRY_URL} /
- * {@code KAFKA_GROUP_ID} / {@code BOUNDED} / {@code OPENSEARCH_HOST} / {@code OPENSEARCH_PORT} /
- * {@code OPENSEARCH_SCHEME} / {@code WEB_UI_PORT} / {@code CHECKPOINT_DIR}로 override 가능.
+ * <p>환경변수 override: {@code BOOTSTRAP_SERVERS} / {@code SCHEMA_REGISTRY_URL} / {@code KAFKA_GROUP_ID}
+ * / {@code BOUNDED} / {@code OPENSEARCH_HOST|PORT|SCHEME} / {@code WEB_UI_PORT} / {@code CHECKPOINT_DIR}
+ * / {@code TOP_N} / {@code ALLOWED_LATENESS_MS} / {@code IDLENESS_MS} / {@code STATE_TTL_HOURS}
+ * / {@code SINK_DELAY_MS} / {@code FAIL_AFTER}.
  */
 public final class FlinkUserActivityAnalyticsJob {
 
@@ -85,7 +99,24 @@ public final class FlinkUserActivityAnalyticsJob {
     private static final String CLICK = "CLICK";
 
     /** P3: tumbling window 크기. */
-    private static final Time WINDOW_SIZE = Time.minutes(5);
+    private static final org.apache.flink.streaming.api.windowing.time.Time WINDOW_SIZE =
+            org.apache.flink.streaming.api.windowing.time.Time.minutes(5);
+
+    /** 2차 Top N: 윈도우별 상위 몇 개 페이지를 낼지(기본 3). */
+    private static final int DEFAULT_TOP_N = 3;
+
+    /** 2차 late: 윈도우 종료 후 이만큼은 늦은 이벤트를 받아 윈도우를 재발화(이후는 late side output). */
+    private static final long DEFAULT_ALLOWED_LATENESS_MS = 60_000L;
+
+    /** 2차 watermark idleness: 데이터 없는 source subtask를 idle로 표시해 워터마크 정체 방지(R3 이월). */
+    private static final long DEFAULT_IDLENESS_MS = 10_000L;
+
+    /** 2차 State TTL: TopN state 누수 안전망(시간, 윈도우+lateness보다 충분히 길게). */
+    private static final long DEFAULT_STATE_TTL_HOURS = 1L;
+
+    /** 2차 late: 늦은 이벤트 side output 태그(window operator 입력 타입 = UserActivityEvent). */
+    private static final OutputTag<UserActivityEvent> LATE_TAG =
+            new OutputTag<>("late-events", TypeInformation.of(UserActivityEvent.class));
 
     private FlinkUserActivityAnalyticsJob() {
     }
@@ -101,84 +132,113 @@ public final class FlinkUserActivityAnalyticsJob {
         int webUiPort = Integer.parseInt(getenvOr("WEB_UI_PORT", String.valueOf(DEFAULT_WEB_UI_PORT)));
         String checkpointDir = getenvOr("CHECKPOINT_DIR", DEFAULT_CHECKPOINT_DIR);
 
+        int topN = Integer.parseInt(getenvOr("TOP_N", String.valueOf(DEFAULT_TOP_N)));
+        long allowedLatenessMs =
+                Long.parseLong(getenvOr("ALLOWED_LATENESS_MS", String.valueOf(DEFAULT_ALLOWED_LATENESS_MS)));
+        long idlenessMs = Long.parseLong(getenvOr("IDLENESS_MS", String.valueOf(DEFAULT_IDLENESS_MS)));
+        long stateTtlHours =
+                Long.parseLong(getenvOr("STATE_TTL_HOURS", String.valueOf(DEFAULT_STATE_TTL_HOURS)));
+        long sinkDelayMs = Long.parseLong(getenvOr("SINK_DELAY_MS", "0"));
+        long failAfter = Long.parseLong(getenvOr("FAIL_AFTER", "0"));
+
         LOG.info("Job 설정: bootstrap={} registry={} group={} bounded={} opensearch={}://{}:{} webUiPort={} checkpointDir={}",
                 bootstrap, registry, groupId, bounded, opensearchScheme, opensearchHost, opensearchPort, webUiPort, checkpointDir);
+        LOG.info("2차 설정: topN={} allowedLatenessMs={} idlenessMs={} stateTtlHours={} sinkDelayMs={} failAfter={}",
+                topN, allowedLatenessMs, idlenessMs, stateTtlHours, sinkDelayMs, failAfter);
 
         // W1 [Web UI]: 로컬 MiniCluster에 REST/Web UI를 부착해 DAG·backpressure·watermark를 관찰.
-        //   createLocalEnvironmentWithWebUI는 항상 로컬 MiniCluster를 띄운다(클러스터 제출은 후순위).
-        //   UI는 Job 실행 중에만 생존 → 관찰하려면 BOUNDED=false(무한 스트리밍)로 실행할 것.
-        //   (BOUNDED=true는 end-of-input에서 즉시 종료돼 UI 접속 불가.)
         Configuration conf = new Configuration();
         conf.set(RestOptions.PORT, webUiPort);
+        // 2차 견고성 — restart strategy: task/TM 장애 시 fixed-delay로 재시작 → 마지막 checkpoint에서
+        //   Kafka offset + window/Top N state가 함께 복원된다(장애 복구 데모의 전제).
+        conf.set(RestartStrategyOptions.RESTART_STRATEGY, "fixed-delay");
+        conf.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS, 3);
+        conf.set(RestartStrategyOptions.RESTART_STRATEGY_FIXED_DELAY_DELAY, Duration.ofSeconds(5));
         StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf);
 
-        // R1 [Runtime: Checkpoint] — 60초 주기 checkpoint 활성화 + Kafka offset checkpoint 연동.
-        //   KafkaSource는 checkpoint 시 현재 partition offset을 함께 스냅샷한다(소스 of truth = checkpoint).
-        //   checkpoint 완료 시 모니터링용으로만 Kafka에 offset commit(auto-commit 비의존, source factory 참조).
-        //   복구 시 window/집계 state와 Kafka offset이 함께 일관되게 복원된다.
-        //   EXACTLY_ONCE: Flink 내부 state는 정확히 1회. (OpenSearch sink는 트랜잭션이 아니므로
-        //   at-least-once + deterministic id로 멱등 보장 — 가드레일 #5.)
+        // R1 [Runtime: Checkpoint] — 60초 주기 checkpoint + Kafka offset checkpoint 연동.
         env.enableCheckpointing(CHECKPOINT_INTERVAL_MS, CheckpointingMode.EXACTLY_ONCE);
         CheckpointConfig checkpointConfig = env.getCheckpointConfig();
         checkpointConfig.setCheckpointTimeout(CHECKPOINT_TIMEOUT_MS);
         checkpointConfig.setMinPauseBetweenCheckpoints(CHECKPOINT_MIN_PAUSE_MS);
-        // min-pause를 쓰려면 동시 checkpoint는 1개여야 한다.
         checkpointConfig.setMaxConcurrentCheckpoints(1);
         checkpointConfig.setTolerableCheckpointFailureNumber(TOLERABLE_CHECKPOINT_FAILURES);
-        // cancel 후에도 마지막 checkpoint를 보존(수동 복구/재시작 기준점). 삭제는 운영자 책임.
         checkpointConfig.setExternalizedCheckpointCleanup(
                 ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
-        // checkpoint 저장소 = 로컬 파일시스템. 기본(JobManager 메모리)은 프로세스 종료 시 사라져
-        //   retain·복구 데모가 불가하므로 파일시스템으로 둔다. (state backend는 기본 HashMap 유지;
-        //   대용량 state면 RocksDB로 교체 여지 — CLAUDE.md.)
         checkpointConfig.setCheckpointStorage(checkpointDir);
 
-        KafkaSource<UserActivityEvent> source =
+        // ── Source: 원본 byte[] (Avro deser는 DLQ를 위해 split-deser로 이동) ──
+        KafkaSource<byte[]> source =
                 UserActivityKafkaSourceFactory.create(bootstrap, registry, groupId, bounded);
-
-        // Watermark는 아래 assign-watermark operator에서 별도로 부여하므로 source에는 noWatermarks.
-        DataStreamSource<UserActivityEvent> events = env.fromSource(
+        DataStreamSource<byte[]> rawEvents = env.fromSource(
                 source, WatermarkStrategy.noWatermarks(), "source-user-activity-events");
-        events.uid("source-user-activity-events");
+        rawEvents.uid("source-user-activity-events");
 
-        // S5 [assign-watermark]: Event Time = Avro eventTime(epoch ms), 30s out-of-orderness.
+        // ── 2차 DLQ [split-deser]: Avro 역직렬화(try/catch). 성공=main, 실패=DLQ side output ──
+        SingleOutputStreamOperator<UserActivityEvent> events = rawEvents
+                .process(new AvroDeserSplitter(registry))
+                .name("split-deser").uid("split-deser");
+
+        DataStream<DlqRecord> dlq = events.getSideOutput(AvroDeserSplitter.DLQ_TAG);
+        dlq.sinkTo(OpenSearchSinkFactory.dlqSink(opensearchHost, opensearchPort, opensearchScheme))
+                .name("sink-opensearch-dlq").uid("sink-opensearch-dlq");
+
+        // S5 [assign-watermark]: Event Time = eventTime, 30s OoO + withIdleness(idle subtask 정체 방지).
         SingleOutputStreamOperator<UserActivityEvent> timestamped = events
                 .assignTimestampsAndWatermarks(
                         WatermarkStrategy
                                 .<UserActivityEvent>forBoundedOutOfOrderness(MAX_OUT_OF_ORDERNESS)
-                                .withTimestampAssigner((event, recordTimestamp) -> {
-                                    long eventTime = event.getEventTime();
-                                    LOG.debug("assign-watermark: eventId={} page={} type={} eventTime={}",
-                                            event.getEventId(), event.getPageId(), event.getEventType(), eventTime);
-                                    return eventTime;
-                                }))
+                                .withTimestampAssigner((event, recordTimestamp) -> event.getEventTime())
+                                .withIdleness(Duration.ofMillis(idlenessMs)))
                 .name("assign-watermark").uid("assign-watermark");
 
-        // P1 [filter-click]: eventType == CLICK 만 통과 (VIEW 등은 집계 대상 아님).
+        // P1 [filter-click]: eventType == CLICK 만 통과.
         SingleOutputStreamOperator<UserActivityEvent> clicks = timestamped
                 .filter(event -> CLICK.equals(event.getEventType()))
                 .name("filter-click").uid("filter-click");
 
-        // P2 keyBy(pageId) + P3 [window-pageclick-5m]:
-        //   동일 pageId는 동일 task로 → 5분 event-time tumbling window 단위로,
-        //   증분 AggregateFunction(count) + ProcessWindowFunction(window 메타 부착) → PageClickCount.
-        SingleOutputStreamOperator<PageClickCount> pageClickCounts = clicks
+        // 2차 견고성(선택) [fault-injection]: FAIL_AFTER>0이면 한 번 일부러 죽여 checkpoint 복구를 관찰.
+        DataStream<UserActivityEvent> beforeWindow = clicks;
+        if (failAfter > 0) {
+            beforeWindow = clicks.map(new FaultInjectionMapper(failAfter))
+                    .name("fault-injection").uid("fault-injection");
+        }
+
+        // P2 keyBy(pageId) + P3 [window-pageclick-5m] + 2차 late(allowedLateness + late side output).
+        SingleOutputStreamOperator<PageClickCount> pageClickCounts = beforeWindow
                 .keyBy(UserActivityEvent::getPageId)
                 .window(TumblingEventTimeWindows.of(WINDOW_SIZE))
+                // allowedLateness는 windowing Time, State TTL은 common Time — 타입이 달라 windowing 쪽만 풀네임.
+                .allowedLateness(
+                        org.apache.flink.streaming.api.windowing.time.Time.milliseconds(allowedLatenessMs))
+                .sideOutputLateData(LATE_TAG)
                 .aggregate(new PageClickCountAggregator(), new PageClickWindowResultFunction())
                 .name("window-pageclick-5m").uid("window-pageclick-5m");
 
-        // K1·K2 [sink-opensearch-agg]: PageClickCount → JSON 문서(deterministic id) → OpenSearch.
-        //   K1 매핑(OpenSearchDocs) + K2 sink(bulk/retry, at-least-once). 같은 윈도우 결과는 같은
-        //   doc id로 덮어쓰기 → 재처리 시 중복 문서 미발생(K3 멱등성). P3의 print()를 대체.
+        // 2차 late [sink-opensearch-late]: allowedLateness 초과로 버려질 늦은 이벤트 → user-activity-late.
+        pageClickCounts.getSideOutput(LATE_TAG)
+                .sinkTo(OpenSearchSinkFactory.lateSink(opensearchHost, opensearchPort, opensearchScheme))
+                .name("sink-opensearch-late").uid("sink-opensearch-late");
+
+        // K1·K2 [sink-opensearch-agg]: PageClickCount → user-activity-agg (SINK_DELAY_MS로 지연 주입 가능).
         pageClickCounts
-                .sinkTo(OpenSearchSinkFactory.aggSink(opensearchHost, opensearchPort, opensearchScheme))
+                .sinkTo(OpenSearchSinkFactory.aggSink(
+                        opensearchHost, opensearchPort, opensearchScheme, sinkDelayMs))
                 .name("sink-opensearch-agg").uid("sink-opensearch-agg");
 
-        LOG.info("DAG 조립 완료: source-user-activity-events → assign-watermark → filter-click "
-                + "→ keyBy(pageId) → window-pageclick-5m → sink-opensearch-agg | Web UI: http://localhost:{}",
-                webUiPort);
+        // 2차 Top N [topn-pages]: keyBy(windowEnd) → 윈도우별 상위 N(State TTL, 계산 후 clear).
+        SingleOutputStreamOperator<TopPageResult> topNResults = pageClickCounts
+                .keyBy(PageClickCount::getWindowEnd)
+                .process(new TopNPagesFunction(topN, Time.hours(stateTtlHours)))
+                .name("topn-pages").uid("topn-pages");
+
+        topNResults
+                .sinkTo(OpenSearchSinkFactory.topnSink(opensearchHost, opensearchPort, opensearchScheme))
+                .name("sink-opensearch-topn").uid("sink-opensearch-topn");
+
+        LOG.info("DAG 조립 완료(2차): source → split-deser(→DLQ) → assign-watermark → filter-click "
+                + "→ window(→late) → {{agg, topn}} | Web UI: http://localhost:{}", webUiPort);
         LOG.info("Job 제출: 'flink-user-activity-analytics' (bounded={})", bounded);
 
         env.execute("flink-user-activity-analytics");

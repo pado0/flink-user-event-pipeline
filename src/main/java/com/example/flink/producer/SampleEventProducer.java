@@ -55,6 +55,9 @@ public final class SampleEventProducer {
         int count = args.length > 0 ? Integer.parseInt(args[0]) : 60;
         String bootstrap = getenvOr("BOOTSTRAP_SERVERS", "localhost:9092");
         String registry = getenvOr("SCHEMA_REGISTRY_URL", "http://localhost:8081");
+        // 2차 late 테스트용: 모든 이벤트 eventTime을 이만큼(ms) 과거로 끌어내려, 이미 워터마크가 지난
+        //   윈도우로 도착하게 만든다(allowedLateness 초과 시 late side output). 기본 0(무영향).
+        long backdateMs = Long.parseLong(getenvOr("EVENT_TIME_BACKDATE_MS", "0"));
 
         Properties props = new Properties();
         props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
@@ -64,10 +67,10 @@ public final class SampleEventProducer {
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.CLIENT_ID_CONFIG, "sample-event-producer");
 
-        LOG.info("producer 시작: bootstrap={} registry={} topic={} count={}",
-                bootstrap, registry, TOPIC, count);
+        LOG.info("producer 시작: bootstrap={} registry={} topic={} count={} backdateMs={}",
+                bootstrap, registry, TOPIC, count, backdateMs);
 
-        long now = System.currentTimeMillis();
+        long now = System.currentTimeMillis() - backdateMs;
         AtomicInteger ok = new AtomicInteger();
         AtomicInteger fail = new AtomicInteger();
 
