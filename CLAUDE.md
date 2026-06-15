@@ -169,9 +169,9 @@ externalized checkpoint **retain on cancellation**, state backend(메모리→Ro
 - [x] `W1` 로컬 MiniCluster **Flink Web UI** 활성화 — `flink-runtime-web`(`provided`) 추가 + env를 `StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf)`로 교체, `RestOptions.PORT = 8082` 지정(**8081은 Schema Registry와 충돌**). *(검증: 무한 스트리밍(`BOUNDED=false`)으로 실행 중 `http://localhost:8082`에서 DAG의 operator name/uid 라벨 · operator별 backpressure/numRecordsIn·Out · watermark · (R1 이후) checkpoint 확인. **UI는 Job 실행 중에만 생존** → `BOUNDED=true`는 즉시 종료돼 관찰 불가.)*
 
 ### 1차 — Runtime
-- [ ] `R1` Checkpoint 활성화(60s) + Kafka offset checkpoint 연동
-- [ ] `R2` 전 operator `.name()` + `.uid()`
-- [ ] `R3` E2E 검증(produce → agg 인덱스까지 흐름)
+- [x] `R1` Checkpoint 활성화(60s) + Kafka offset checkpoint 연동 *(EXACTLY_ONCE, timeout/min-pause/tolerable-failure, retain-on-cancellation, file:// checkpoint storage. 검증: completed checkpoint·chk dir·offset commit·재현)*
+- [x] `R2` 전 operator `.name()` + `.uid()` *(source/assign-watermark/filter-click/window-pageclick-5m/sink-opensearch-agg 전부 부여, keyBy는 partitioning이라 제외)*
+- [x] `R3` E2E 검증(produce → agg 인덱스까지 흐름) *(BOUNDED: agg 34문서, count 합 401 == 전체 CLICK 401)*
 
 ### 2차 — Process (Top N)
 - [ ] `keyBy(windowEnd)` → `TopNPagesFunction`(KeyedProcessFunction, 상위 N만 bounded 유지, 계산 후 state clear) → `TopPageResult` `[topn-pages]`

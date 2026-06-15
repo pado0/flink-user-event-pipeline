@@ -45,8 +45,14 @@ public final class UserActivityKafkaSourceFactory {
                 .setBootstrapServers(bootstrapServers)
                 .setTopics(TOPIC)
                 .setGroupId(groupId)
-                // 시작 오프셋은 earliest. (checkpoint 도입 전이라 재실행 시 처음부터 다시 읽음)
+                // 시작 오프셋은 earliest (학습용: bounded 재실행마다 토픽을 처음부터 다시 읽어
+                //   K3 멱등성/E2E 검증이 반복 가능). 단, checkpoint/savepoint에서 복구할 때는 이
+                //   설정과 무관하게 checkpoint에 스냅샷된 offset에서 재개된다(시작 오프셋은 최초 기동만).
                 .setStartingOffsets(OffsetsInitializer.earliest())
+                // R1 [Kafka offset checkpoint 연동]: offset의 source of truth = Flink checkpoint.
+                //   Kafka auto-commit에 의존하지 않고(KafkaSource가 내부적으로 비활성화), checkpoint
+                //   완료 시점에만 모니터링/가시성 목적으로 Kafka에 offset을 commit한다(기본값 true).
+                .setProperty("commit.offsets.on.checkpoint", "true")
                 .setValueOnlyDeserializer(
                         ConfluentRegistryAvroDeserializationSchema.forSpecific(
                                 UserActivityEvent.class, schemaRegistryUrl));

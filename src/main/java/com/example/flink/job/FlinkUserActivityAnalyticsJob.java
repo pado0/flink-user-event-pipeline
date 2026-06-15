@@ -11,8 +11,11 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
@@ -22,9 +25,10 @@ import org.slf4j.LoggerFactory;
 /**
  * Flink user-activity 분석 파이프라인 Job (DAG 조립 + env 설정).
  *
- * <p>현재 구현 단계: <b>K1·K2</b> — Event Time 부여한 스트림을 CLICK 필터 → pageId keyBy →
+ * <p>현재 구현 단계: <b>R1·R2·R3</b> — Event Time 부여한 스트림을 CLICK 필터 → pageId keyBy →
  * 5분 tumbling window로 집계({@link PageClickCount})한 뒤, JSON 문서(deterministic id)로 매핑해
- * OpenSearch {@code user-activity-agg} 인덱스에 bulk/retry로 적재한다.
+ * OpenSearch {@code user-activity-agg} 인덱스에 bulk/retry로 적재한다. R1에서 60초 checkpoint
+ * (Kafka offset 연동, retain-on-cancellation)를 활성화했고, R2로 전 operator에 name/uid를 부여했다.
  *
  * <p>현재 DAG:
  * <pre>
@@ -47,7 +51,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>엔드포인트/그룹은 환경변수 {@code BOOTSTRAP_SERVERS} / {@code SCHEMA_REGISTRY_URL} /
  * {@code KAFKA_GROUP_ID} / {@code BOUNDED} / {@code OPENSEARCH_HOST} / {@code OPENSEARCH_PORT} /
- * {@code OPENSEARCH_SCHEME} / {@code WEB_UI_PORT}로 override 가능.
+ * {@code OPENSEARCH_SCHEME} / {@code WEB_UI_PORT} / {@code CHECKPOINT_DIR}로 override 가능.
  */
 public final class FlinkUserActivityAnalyticsJob {
 
@@ -57,6 +61,22 @@ public final class FlinkUserActivityAnalyticsJob {
 
     /** W1: 로컬 MiniCluster Web UI 기본 포트. 8081은 Schema Registry가 점유하므로 8082 사용. */
     private static final int DEFAULT_WEB_UI_PORT = 8082;
+
+    /** R1: checkpoint 주기(60초) — CLAUDE.md "Checkpoint / State 설정" 기준. */
+    private static final long CHECKPOINT_INTERVAL_MS = 60_000L;
+
+    /** R1: checkpoint 한 번이 이 시간 내에 못 끝나면 실패 처리(느린 sink로 무한정 매달림 방지). */
+    private static final long CHECKPOINT_TIMEOUT_MS = 60_000L;
+
+    /** R1: 직전 checkpoint 완료 후 다음 시작까지 최소 휴지 — 연속 checkpoint가 throughput 잠식 방지. */
+    private static final long CHECKPOINT_MIN_PAUSE_MS = 30_000L;
+
+    /** R1: 연속 checkpoint 실패를 job 실패로 간주하기 전 허용 횟수(일시적 장애 흡수). */
+    private static final int TOLERABLE_CHECKPOINT_FAILURES = 3;
+
+    /** R1: checkpoint 저장소(로컬 파일시스템) 기본 경로. retain-on-cancellation·복구 데모용. */
+    private static final String DEFAULT_CHECKPOINT_DIR =
+            "file:///tmp/flink-checkpoints/user-activity-analytics";
 
     /** 가드레일: Event Time 기준 처리, 30초 out-of-orderness 허용. */
     private static final Duration MAX_OUT_OF_ORDERNESS = Duration.ofSeconds(30);
@@ -79,9 +99,10 @@ public final class FlinkUserActivityAnalyticsJob {
         int opensearchPort = Integer.parseInt(getenvOr("OPENSEARCH_PORT", "9200"));
         String opensearchScheme = getenvOr("OPENSEARCH_SCHEME", "http");
         int webUiPort = Integer.parseInt(getenvOr("WEB_UI_PORT", String.valueOf(DEFAULT_WEB_UI_PORT)));
+        String checkpointDir = getenvOr("CHECKPOINT_DIR", DEFAULT_CHECKPOINT_DIR);
 
-        LOG.info("Job 설정: bootstrap={} registry={} group={} bounded={} opensearch={}://{}:{} webUiPort={}",
-                bootstrap, registry, groupId, bounded, opensearchScheme, opensearchHost, opensearchPort, webUiPort);
+        LOG.info("Job 설정: bootstrap={} registry={} group={} bounded={} opensearch={}://{}:{} webUiPort={} checkpointDir={}",
+                bootstrap, registry, groupId, bounded, opensearchScheme, opensearchHost, opensearchPort, webUiPort, checkpointDir);
 
         // W1 [Web UI]: 로컬 MiniCluster에 REST/Web UI를 부착해 DAG·backpressure·watermark를 관찰.
         //   createLocalEnvironmentWithWebUI는 항상 로컬 MiniCluster를 띄운다(클러스터 제출은 후순위).
@@ -91,6 +112,27 @@ public final class FlinkUserActivityAnalyticsJob {
         conf.set(RestOptions.PORT, webUiPort);
         StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.createLocalEnvironmentWithWebUI(conf);
+
+        // R1 [Runtime: Checkpoint] — 60초 주기 checkpoint 활성화 + Kafka offset checkpoint 연동.
+        //   KafkaSource는 checkpoint 시 현재 partition offset을 함께 스냅샷한다(소스 of truth = checkpoint).
+        //   checkpoint 완료 시 모니터링용으로만 Kafka에 offset commit(auto-commit 비의존, source factory 참조).
+        //   복구 시 window/집계 state와 Kafka offset이 함께 일관되게 복원된다.
+        //   EXACTLY_ONCE: Flink 내부 state는 정확히 1회. (OpenSearch sink는 트랜잭션이 아니므로
+        //   at-least-once + deterministic id로 멱등 보장 — 가드레일 #5.)
+        env.enableCheckpointing(CHECKPOINT_INTERVAL_MS, CheckpointingMode.EXACTLY_ONCE);
+        CheckpointConfig checkpointConfig = env.getCheckpointConfig();
+        checkpointConfig.setCheckpointTimeout(CHECKPOINT_TIMEOUT_MS);
+        checkpointConfig.setMinPauseBetweenCheckpoints(CHECKPOINT_MIN_PAUSE_MS);
+        // min-pause를 쓰려면 동시 checkpoint는 1개여야 한다.
+        checkpointConfig.setMaxConcurrentCheckpoints(1);
+        checkpointConfig.setTolerableCheckpointFailureNumber(TOLERABLE_CHECKPOINT_FAILURES);
+        // cancel 후에도 마지막 checkpoint를 보존(수동 복구/재시작 기준점). 삭제는 운영자 책임.
+        checkpointConfig.setExternalizedCheckpointCleanup(
+                ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        // checkpoint 저장소 = 로컬 파일시스템. 기본(JobManager 메모리)은 프로세스 종료 시 사라져
+        //   retain·복구 데모가 불가하므로 파일시스템으로 둔다. (state backend는 기본 HashMap 유지;
+        //   대용량 state면 RocksDB로 교체 여지 — CLAUDE.md.)
+        checkpointConfig.setCheckpointStorage(checkpointDir);
 
         KafkaSource<UserActivityEvent> source =
                 UserActivityKafkaSourceFactory.create(bootstrap, registry, groupId, bounded);

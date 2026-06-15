@@ -1,7 +1,7 @@
 # HANDOFF — Flink 실시간 분석 파이프라인 (연습 프로젝트)
 
 > 작업 인수인계 문서. 현재까지의 구현 상태 · 검증 결과 · 다음 할 일 · 환경 제약을 정리한다.
-> 최종 갱신: **2026-06-14** (`W1` 로컬 MiniCluster Flink Web UI 활성화 완료 — `flink-runtime-web` 추가 + `createLocalEnvironmentWithWebUI(8082)`, 실행 중 REST/UI 노출 검증) / 기준 커밋: `d49237b`(W1 커밋·푸시 완료, 이 문서 정정 커밋이 HEAD)
+> 최종 갱신: **2026-06-14** (`R1·R2·R3` 1차 Runtime 완료 — 60초 checkpoint(EXACTLY_ONCE, retain-on-cancellation, file:// 저장소) + Kafka offset 연동, 전 operator name/uid 점검, E2E 검증. **1차 파이프라인 전체 완료**) / 직전 기준 커밋: `0fb0197`(로깅), 이 작업 커밋이 HEAD가 됨
 
 ---
 
@@ -22,9 +22,12 @@ Kafka(Avro) 사용자 행동 이벤트를 Flink로 실시간 집계해 OpenSearc
 | **P1·P2·P3** | filter-click → keyBy(pageId) → 5min tumbling window → `PageClickCount` | ✅ 완료 |
 | **K1·K2·K3** | `PageClickCount` → JSON 문서(deterministic id) → OpenSearch sink(bulk/retry) + 멱등성 검증 | ✅ 완료 |
 | **W1** | 로컬 MiniCluster Flink Web UI 활성화(`flink-runtime-web` + `createLocalEnvironmentWithWebUI`, port 8082) | ✅ 완료 |
-| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ⬜ **다음 차례** |
-| R2·R3 | 전 operator name/uid 점검 / E2E 검증 | ⬜ |
-| 2차 | Top N / DLQ / State TTL / backpressure | ⬜ |
+| **R1** | Checkpoint(60s) 활성화 + Kafka offset checkpoint 연동 | ✅ 완료 |
+| **R2** | 전 operator name/uid 점검 | ✅ 완료 |
+| **R3** | E2E 검증(produce → agg 인덱스) | ✅ 완료 |
+| 2차 | Top N → DLQ → State TTL → backpressure | ⬜ **다음 차례** |
+
+> **1차 파이프라인 전체(S1~R3) 완료.** 다음은 2차(Top N부터).
 
 > **작업 규칙(중요):** 사용자는 **한 스텝씩만** 구현하고 멈추길 원함. 검증 게이트 통과 후 다음 진행. 임의로 다음 스텝 선행 금지.
 
@@ -55,7 +58,7 @@ filnk-practice/
         │   ├── OpenSearchDocs.java                 # K1: PageClickCount → JSON 문서(Jackson) + deterministic doc id
         │   └── OpenSearchSinkFactory.java          # K2: Opensearch2Sink(bulk/retry, at-least-once)
         └── job/
-            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립 + env(W1: createLocalEnvironmentWithWebUI, port 8082). source→assign-watermark→filter-click→keyBy→window→sink-opensearch-agg
+            └── FlinkUserActivityAnalyticsJob.java  # DAG 조립 + env(W1: createLocalEnvironmentWithWebUI 8082, R1: checkpoint 60s/EXACTLY_ONCE/retain/file:// 저장소). source→assign-watermark→filter-click→keyBy→window→sink-opensearch-agg
 ```
 
 빌드 산출물 `target/generated-sources/avro/.../UserActivityEvent.java`는 **gitignore 대상**(커밋 안 함).
@@ -147,6 +150,19 @@ DAG: `… → window-pageclick-5m → sink-opensearch-agg`.
   - ⚠️ **Web UI는 Job 실행 중에만 생존** → 관찰하려면 `BOUNDED=false`(무한 스트리밍)로 띄울 것. `BOUNDED=true`는 end-of-input에서 즉시 종료돼 UI 접속 불가.
 - 검증(§4 W1 커맨드): 무한 스트리밍 실행 → `localhost:8082` HTTP 200, `/jobs/overview` Job RUNNING, `/jobs/{jid}` vertices에 **operator name/uid 라벨 그대로 노출**(`source-user-activity-events → assign-watermark → filter-click` chain, `window-pageclick-5m → sink-opensearch-agg` chain — 가드레일 #4). Ctrl+C(또는 프로세스 kill) 후 8082 닫힘 확인.
 
+### R1·R2·R3 — Runtime (Checkpoint + operator 식별 + E2E)
+**1차 파이프라인의 런타임 마감.** `job`·`source` 두 파일만 수정(pom 변경 없음 — `file://` 로컬 checkpoint 저장소는 flink-core 내장).
+
+- **R1 [Checkpoint + Kafka offset 연동]** `job/FlinkUserActivityAnalyticsJob.java` env 설정:
+  - `env.enableCheckpointing(60_000, CheckpointingMode.EXACTLY_ONCE)` — CLAUDE.md 60초 기준.
+  - `CheckpointConfig`: `setCheckpointTimeout(60s)`(느린 sink로 무한 매달림 방지), `setMinPauseBetweenCheckpoints(30s)`(연속 checkpoint가 throughput 잠식 방지), `setMaxConcurrentCheckpoints(1)`(min-pause 전제), `setTolerableCheckpointFailureNumber(3)`(일시적 실패 흡수), `setExternalizedCheckpointCleanup(RETAIN_ON_CANCELLATION)`(cancel 후에도 마지막 checkpoint 보존).
+  - `setCheckpointStorage("file:///tmp/flink-checkpoints/user-activity-analytics")` — 기본 JobManager 메모리 저장소는 프로세스 종료 시 사라져 retain·복구 데모가 불가하므로 **로컬 파일시스템**으로 둠. `CHECKPOINT_DIR` env로 override. State backend는 기본 HashMap 유지(대용량이면 RocksDB 여지 — CLAUDE.md).
+  - **EXACTLY_ONCE**는 Flink 내부 state 한정. OpenSearch sink는 트랜잭션이 아니라 `AT_LEAST_ONCE` + deterministic id로 멱등 보장(가드레일 #5) — 모드가 달라도 정확성 유지.
+  - **Kafka offset 연동** `source/UserActivityKafkaSourceFactory.java`: offset의 source of truth = Flink checkpoint. `setProperty("commit.offsets.on.checkpoint","true")` 명시(KafkaSource는 auto-commit 비의존, checkpoint 완료 시점에만 모니터링용 commit). 시작 오프셋은 `earliest` 유지 — bounded 재실행마다 토픽을 처음부터 읽어 K3 멱등성/E2E 검증이 반복 가능(복구 시엔 시작 오프셋과 무관하게 checkpoint의 offset에서 재개).
+- **R2 [operator name/uid]**: 전 operator 점검 — `source-user-activity-events`(name=`fromSource` 3번째 인자 + `.uid()`), `assign-watermark`, `filter-click`, `window-pageclick-5m`, `sink-opensearch-agg` 전부 `.name()`+`.uid()` 부여 완료. `keyBy(pageId)`는 partitioning이라 미부여(정상). W1 Web UI vertices 라벨로도 확인됨(가드레일 #4). → 신규 코드 변경 없이 점검만(이미 각 스텝에서 부여해 둠).
+- **R3 [E2E]**: produce → Kafka → Flink(filter→keyBy→window) → OpenSearch agg 인덱스 전 구간 흐름 검증. BOUNDED 실행으로 윈도우가 end-of-input에서 전부 firing → agg 인덱스 적재. (검증은 §4)
+- ⚠️ **스트리밍 모드 윈도우 firing 주의(1차 한계, 2차 robustness 과제)**: `createLocalEnvironmentWithWebUI`의 기본 parallelism(= CPU 코어 수, 이 머신 12) > 토픽 파티션(3)이라 데이터 없는 **idle source subtask가 watermark를 MIN으로 묶어** 무한 스트리밍에선 윈도우가 firing되지 않는다(R1 streaming 검증 시 checkpoint는 정상이나 agg 인덱스는 비어 있었음). bounded는 end-of-input에서 전 subtask가 final watermark(MAX)를 방출해 firing됨. 실 스트리밍 firing은 `WatermarkStrategy.withIdleness(...)` 또는 parallelism을 파티션 수로 맞춰야 함 → **2차(late/robustness) 과제로 이월**.
+
 ## 4. 재현 — 어떻게 띄우고 검증하나
 
 > ⚠️ 이 머신은 **colima** 런타임. `docker compose`(공백)가 아니라 **`docker-compose`(하이픈)** 사용. (자세한 환경 제약은 §6)
@@ -234,6 +250,43 @@ curl -s 'localhost:9200/user-activity-agg/_search?size=1'
 curl -s 'localhost:9200/user-activity-agg/_doc/<docId>' | grep -oE '"_version":[0-9]+'
 ```
 
+### R1·R2·R3 Runtime 검증 커맨드
+```bash
+# (R1) 무한 스트리밍으로 기동 → ~60초 후 첫 checkpoint 완료 관찰 (interval 60s)
+rm -rf /tmp/flink-checkpoints/user-activity-analytics      # 깨끗한 관찰을 위해 정리
+mvn -q compile exec:exec@job > /tmp/job.log 2>&1 &
+
+# R1-1) checkpoint 완료 수 (REST) → completed >= 1
+jid=$(curl -s localhost:8082/jobs/overview | grep -oE '"jid":"[a-f0-9]+"' | head -1 | grep -oE '[a-f0-9]{20,}')
+curl -s "localhost:8082/jobs/$jid/checkpoints" | python3 -c "import sys,json;print(json.load(sys.stdin)['counts'])"
+
+# R1-2) checkpoint 디렉터리 on disk → chk-N 존재
+find /tmp/flink-checkpoints/user-activity-analytics -name 'chk-*' -type d
+
+# R1-3) 로그에서 완료 확인 → "Completed checkpoint N for job ..."
+grep -E "Completed checkpoint" /tmp/job.log | head -2
+
+# R1-4) Kafka offset이 checkpoint와 함께 commit됨 (auto-commit 비의존) → CURRENT-OFFSET == LOG-END-OFFSET
+docker-compose exec -T kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --describe --group flink-user-activity-analytics
+
+# R1-5) retain-on-cancellation: job kill 후에도 chk-N 디렉터리 보존
+pkill -f 'com.example.flink.job.FlinkUserActivityAnalyticsJob'
+find /tmp/flink-checkpoints/user-activity-analytics -name 'chk-*' -type d   # 여전히 존재
+
+# (R2) Web UI vertices에 operator name/uid 라벨 노출 (위 W1 검증 커맨드와 동일)
+#   → source-user-activity-events / assign-watermark / filter-click / window-pageclick-5m / sink-opensearch-agg
+
+# (R3) E2E: produce → agg 인덱스. BOUNDED 실행이 윈도우를 end-of-input에서 전부 firing.
+curl -s -XDELETE localhost:9200/user-activity-agg > /dev/null
+mvn -q compile exec:java -Dexec.args=100              # produce
+BOUNDED=true mvn -q compile exec:exec@job             # 처리 + 적재 후 종료
+curl -s -XPOST localhost:9200/user-activity-agg/_refresh > /dev/null
+curl -s localhost:9200/user-activity-agg/_count       # 문서 수
+curl -s localhost:9200/user-activity-agg/_search -H 'Content-Type: application/json' \
+  -d '{"size":0,"aggs":{"total_clicks":{"sum":{"field":"count"}}}}'   # count 합 == 전체 CLICK
+```
+
 ### S3 적재 내용 확인 커맨드
 ```bash
 # 1) subject 등록 확인 → ["user-activity-events-value"]
@@ -266,6 +319,10 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 | Flink K1·K2 sink | `BOUNDED=true … ; curl …/user-activity-agg/_count` | exit 0, 문서 24건, **count 합 == 255(전체 CLICK)**, `_id`=deterministic |
 | Flink K3 멱등성 | BOUNDED job 2회 실행 후 `_count`/`_version` | 문서 수 **24 불변**, `_version` 1→2(덮어쓰기), count 동일 |
 | Flink W1 Web UI | 무한 스트리밍 실행 중 `curl localhost:8082/...` | `/` 200, `/jobs/overview` state RUNNING, vertices에 operator name 라벨 노출; 종료 후 8082 000 |
+| Flink R1 checkpoint | 무한 스트리밍 ~60s → `/jobs/{jid}/checkpoints` + chk dir + 로그 | `completed >= 1`, `chk-N` 디렉터리 존재, 로그 `Completed checkpoint N`, kill 후 chk dir 보존 |
+| Flink R1 offset 연동 | `kafka-consumer-groups --describe --group flink-user-activity-analytics` | checkpoint 후 `CURRENT-OFFSET == LOG-END-OFFSET`(LAG 0), commit됨 |
+| Flink R2 name/uid | 코드 점검 + Web UI vertices | 전 operator name/uid 부여(keyBy 제외), Web UI 라벨 노출 |
+| Flink R3 E2E | produce → `BOUNDED=true` → `_count`/sum | agg 문서수 = 윈도우 수, **count 합 == 전체 CLICK 수** |
 | OpenSearch | `curl -s localhost:9200/_cluster/health` | `status: green`, nodes 1 |
 | Dashboards | `curl -s -o /dev/null -w '%{http_code}' localhost:5601/api/status` | `200` |
 
@@ -280,17 +337,27 @@ docker-compose exec -T schema-registry kafka-avro-console-consumer \
 > K1·K2·K3 실측: 토픽 320건 대상 `BOUNDED=true` 실행 → exit 0(BUILD SUCCESS). `user-activity-agg` 인덱스에 **문서 24건**(P3 윈도우 24행과 일치), **count 합계 255.0 == 전체 CLICK 255**, pageId 분포 page-cart/checkout/product/search 각 5 + page-home 4 = 24. 샘플 `_id`=`page-product_1781323500000_1781323800000_CLICK`(deterministic 규칙 정확), `_source`에 pageId/eventType/window(start·end·Iso)/count 필드 정상. **K3 멱등성**: 동일 입력으로 job 재실행 → 문서 수 **24 그대로**(중복 0), 동일 doc의 `_version` 1→2(덮어쓰기 발생), `count`=11 동일, 합계 255 동일 → deterministic id 기반 upsert로 멱등 확인.
 >
 > W1 실측: `mvn -q compile exec:exec@job`(무한 스트리밍) 백그라운드 실행 → `localhost:8082/` **HTTP 200**, `/overview`에 `flink-version 1.18.1` · `jobs-running 1`. `/jobs/overview` Job `flink-user-activity-analytics` **state RUNNING**(tasks 24/24 running). `/jobs/{jid}` vertices에 **operator name/uid 라벨 그대로 노출**(가드레일 #4): `Source: source-user-activity-events -> assign-watermark -> filter-click`(parallelism 12), `window-pageclick-5m -> sink-opensearch-agg: Writer`(parallelism 12) — operator chaining 확인. 프로세스 kill 후 `localhost:8082` → **000**(UI는 Job 실행 중에만 생존, 정상).
+>
+> **R1 실측** (토픽 500건, fresh 100건 produce 후 무한 스트리밍): job RUNNING(tasks 24/24) → ~60초 후 **checkpoint 1 COMPLETED**(REST `counts={completed:1,failed:0}`, state_size 21,556B, duration 34~50ms). on-disk `chk-1`(이후 `chk-2`) 디렉터리 생성, 로그 `Completed checkpoint 1 for job ... (21663 bytes, checkpointDuration=50 ms)`. **Kafka offset commit 확인**: consumer group `flink-user-activity-analytics` p1=289/p2=211 **CURRENT==LOG-END, LAG 0**(checkpoint와 함께 commit, auto-commit 비의존). **retain-on-cancellation**: 프로세스 kill 후에도 `chk-2` 디렉터리 보존(8082 → 000). ⚠️ 단, 이 스트리밍 실행에선 **agg 인덱스가 비어 있었음** — idle source subtask(parallelism 12 > 파티션 3)가 watermark를 묶어 윈도우가 firing되지 않기 때문(§3 R1·R2·R3 주의, 2차 과제). checkpoint 자체는 정상 동작.
+>
+> **R2 실측**: 전 operator name/uid 점검 — `source-user-activity-events`/`assign-watermark`/`filter-click`/`window-pageclick-5m`/`sink-opensearch-agg` 모두 부여(코드 + Web UI vertices 라벨로 이중 확인), `keyBy(pageId)`는 partitioning이라 미부여(정상). 신규 코드 변경 없이 점검만(각 스텝에서 이미 부여).
+>
+> **R3 실측** (E2E): fresh 100건 produce(`sent=100 failed=0`) → 토픽 누적 500건 대상 `BOUNDED=true` 실행 → exit 0. `user-activity-agg` 인덱스 **문서 34건**, **count 합계 401.0 == 토픽 전체 CLICK 401**(avro-console-consumer 분포: CLICK 401 / VIEW 99) 정확 일치, pageId 분포 cart/checkout/product/search 각 7 + home 6 = 34, 샘플 `_id`=`page-checkout_1781323800000_1781324100000_CLICK`(deterministic). produce→Kafka→Flink(filter/keyBy/window)→OpenSearch 전 구간 흐름 확인.
 
-## 5. 다음 할 일 — R1 (Runtime: Checkpoint)
+## 5. 다음 할 일 — 2차 (Top N)
 
-> W1(로컬 MiniCluster Web UI)은 **완료**(§3 W1, §4 검증). 실 클러스터 제출(`start-cluster.sh` + `flink run`)은 fat-jar(shade)가 필요해 여전히 후순위 — `createLocalEnvironmentWithWebUI`는 로컬 전용이므로 클러스터 제출 단계에서 env 분기 필요.
+> **1차 파이프라인(S1~R3) 전부 완료.** Source→Process→Sink→Web UI→Runtime(checkpoint/식별/E2E)까지 E2E 검증됨. 다음은 2차로, **Top N부터** 한 스텝씩.
 
-CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
-- `job`의 env 설정에 `env.enableCheckpointing(60_000)` 추가. 추가 고려(CLAUDE.md "Checkpoint / State 설정"): checkpoint timeout, min pause between checkpoints, tolerable checkpoint failure number, externalized checkpoint **retain on cancellation**, state backend(메모리→RocksDB) 교체 여지.
-- Kafka offset은 Flink checkpoint와 함께 관리(별도 auto-commit 의존 X) — KafkaSource는 checkpoint 시 offset을 함께 스냅샷.
-- 이후 `R2`(전 operator name/uid 점검 — 대부분 부여됨, 누락 확인), `R3`(E2E 검증: produce → agg 인덱스).
+CLAUDE.md 2차 첫 스텝 — **Top N (Process)**:
+- `window-pageclick-5m`의 `PageClickCount` 스트림을 `keyBy(windowEnd)` → `TopNPagesFunction`(`KeyedProcessFunction`) → `TopPageResult` `[topn-pages]`.
+- 가드레일 #6: 전체 page count를 `ListState`에 무한정 쌓지 말 것 — **상위 N만 bounded 유지, 계산 후 state clear**. 윈도우 종료(타이머) 시점에 정렬·상위 N 추출.
+- 신규 `model/TopPageResult`(windowStart, windowEnd, rank, pageId, clickCount), `topn/TopNPagesFunction`.
+- 이어서 OpenSearch `user-activity-topn` 저장 `[sink-opensearch-topn]` (doc id = `windowStart_windowEnd_rank_pageId`).
+- 그 뒤 2차 견고성(DLQ/late) → 운영(State TTL, backpressure 테스트). **Top N·DLQ·TTL을 한 묶음에 섞지 않는다.**
 
-> 참고: AT_LEAST_ONCE sink는 checkpoint 시점에 pending bulk를 flush한다. 현재는 checkpoint 미활성이라 bulk interval(2s)/close flush로 적재되며, R1에서 checkpoint를 켜면 sink flush가 checkpoint와 정렬된다(멱등 id 덕에 정확성은 이미 보장).
+> 참고(R1 이후): AT_LEAST_ONCE sink는 checkpoint 시점에 pending bulk를 flush한다 → sink flush가 60초 checkpoint와 정렬됨(멱등 id 덕에 정확성은 이미 보장). 실 클러스터 제출(`flink run`)은 fat-jar(shade)가 필요하고 `createLocalEnvironmentWithWebUI`가 로컬 전용이라 여전히 후순위(클러스터 제출 시 env 분기 필요).
+>
+> ⚠️ **2차로 이월된 1차 잔여 이슈**: 무한 스트리밍에서 idle source subtask(parallelism > 파티션)가 watermark를 묶어 윈도우가 firing되지 않음(§3 R1·R2·R3 주의). 2차 late/robustness 단계에서 `WatermarkStrategy.withIdleness(...)` 또는 parallelism 정렬로 해결.
 
 ## 6. 환경 제약 (Apple Silicon + colima) — 반드시 숙지
 
@@ -317,8 +384,12 @@ CLAUDE.md `R1`: **Checkpoint 활성화(60s) + Kafka offset checkpoint 연동.**
   - `d162d31` `docs: W1 로컬 Flink Web UI 스텝을 1차 Runtime 앞에 추가`
   - `83dec7d` `docs: HANDOFF Git 섹션에 0f8aeef·d162d31 커밋 이력 반영`
   - `d49237b` `feat: W1 로컬 MiniCluster Flink Web UI(8082) 활성화`
-  - `<이 커밋>` `docs: HANDOFF Git 섹션을 d49237b(W1) 반영으로 정정` ← 현재 HEAD(`origin/main`)
-- **`origin/main`과 동기화 완료**. S1~K3 + **W1 전부 푸시됨**. (`d49237b` 변경: `pom.xml`에 `flink-runtime-web:1.18.1`(provided) 추가, `job/FlinkUserActivityAnalyticsJob.java` env를 `createLocalEnvironmentWithWebUI`+`RestOptions.PORT 8082`+`WEB_UI_PORT` env로 교체, `CLAUDE.md` W1 체크 ✅, `docs/HANDOFF.md` 갱신. 코드는 `pom.xml`·`job` 2파일만, DAG 로직 불변.)
+  - `7a86c0b` `docs: HANDOFF Git 섹션을 d49237b(W1) 커밋·푸시 반영으로 정정`
+  - `f474fc5` `feat: 파이프라인 관측용 log4j2 로깅 추가`
+  - `0fb0197` `fix: Web UI TaskManager 로그 탭용 파일 appender + -Dlog.file 추가`
+  - `<이 커밋>` `feat: R1·R2·R3 Runtime (60s checkpoint + Kafka offset 연동 + name/uid 점검 + E2E)` ← 현재 HEAD
+- **`origin/main`과 동기화 완료**. S1~K3 + W1 + 로깅 + **R1·R2·R3 전부 푸시됨**. 이 커밋 변경: `job/FlinkUserActivityAnalyticsJob.java`(R1 checkpoint 설정 블록 + R1·R2 doc), `source/UserActivityKafkaSourceFactory.java`(R1 offset 연동 주석 + `commit.offsets.on.checkpoint` 명시), `CLAUDE.md`(R1·R2·R3 ✅), `docs/HANDOFF.md` 갱신. **pom 변경 없음**(`file://` 로컬 checkpoint 저장소는 flink-core 내장), DAG 로직 불변.
+- 참고: `docs/pipeline-class-guide.md`는 별개 학습용 untracked 문서 — 이번 R 커밋에 포함하지 않음.
 
 ## 8. 참고
 
