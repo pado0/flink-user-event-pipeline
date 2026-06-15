@@ -212,6 +212,10 @@
               <executable>java</executable>
               <classpathScope>compile</classpathScope>
               <arguments>
+                <!-- Flink Web UI의 TaskManager Logs 탭이 읽는 로그 파일 위치를 알려준다.
+                     미지정 시 REST가 "The file LOG is not available on the TaskExecutor".
+                     log4j2.properties의 RollingFile appender도 이 경로로 기록. -->
+                <argument>-Dlog.file=${project.build.directory}/flink-logs/flink.log</argument>
                 <argument>-classpath</argument>
                 <classpath/>
                 <argument>com.example.flink.job.FlinkUserActivityAnalyticsJob</argument>
