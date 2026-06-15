@@ -9,25 +9,27 @@
 ## 0. 한눈에 보기 — 전체 데이터 흐름
 
 ```text
-[외부]  SampleEventProducer ──(Avro 직렬화 + Schema Registry 등록)──▶ Kafka: user-activity-events
-        PoisonEventProducer ──(비-Avro 평문, DLQ 테스트용)─────────▶        (같은 토픽)
-                                                                          │
-[Flink Job: FlinkUserActivityAnalyticsJob 가 아래 DAG를 조립·실행]         │
-                                                                          ▼
- ① source-user-activity-events   KafkaSource (raw byte[])              →  byte[]
- ②  split-deser                  Avro deser(try/catch), 실패→DLQ        →  UserActivityEvent  ┐(2차)
- ②' └─(DLQ side output)          DlqRecord(원본 bytes+에러)            →  OpenSearch: user-activity-dlq
- ③ assign-watermark              Event Time = eventTime, 30s OoO + idleness → UserActivityEvent
- ④ filter-click                  eventType == "CLICK" 만 통과          →  UserActivityEvent
- ⑤ keyBy(pageId)                 동일 pageId → 동일 task                  (KeyedStream)
- ⑥ window-pageclick-5m           5분 tumbling + allowedLateness + 증분 count → PageClickCount (POJO)
- ⑥' └─(late side output)         allowedLateness 초과 늦은 이벤트       →  OpenSearch: user-activity-late  (2차)
- ⑦ sink-opensearch-agg           POJO → JSON 문서(+deterministic id)    →  OpenSearch: user-activity-agg
- ⑧ keyBy(windowEnd)→topn-pages   윈도우별 상위 N(KeyedProcessFunction)  →  TopPageResult  ┐(2차)
- ⑨  sink-opensearch-topn         POJO → JSON 문서(+deterministic id)    →  OpenSearch: user-activity-topn
+[외부 producer — Flink DAG 밖]
+  SampleEventProducer  : 정상 Avro 이벤트 → Kafka(user-activity-events)   [첫 직렬화 때 Schema Registry에 스키마 등록]
+  PoisonEventProducer  : 비-Avro 평문(DLQ 테스트용) → 같은 토픽
+
+[Flink Job: FlinkUserActivityAnalyticsJob 가 아래 DAG를 조립·실행]
+
+  (1) source-user-activity-events  — KafkaSource: 메시지를 원본 byte[]로만 읽음(해석 안 함)
+  (2) split-deser                  — Avro 역직렬화 try/catch → UserActivityEvent
+        +- (실패) DLQ side output  → DlqRecord(원본 bytes+에러) → sink-opensearch-dlq → 인덱스 user-activity-dlq
+  (3) assign-watermark             — Event Time = eventTime, 30s out-of-orderness + withIdleness
+  (4) filter-click                 — eventType == "CLICK" 만 통과
+  (5) keyBy(pageId)                — 동일 pageId → 동일 task (KeyedStream)
+  (6) window-pageclick-5m          — 5분 tumbling + allowedLateness(60s), 증분 count → PageClickCount(POJO)
+        +- (side output) 늦은 이벤트 → sink-opensearch-late → 인덱스 user-activity-late
+        +- (main) PageClickCount 스트림은 두 갈래로 분기:
+              +- (7) sink-opensearch-agg  → 인덱스 user-activity-agg
+              +- (8) keyBy(windowEnd) → topn-pages (상위 N, KeyedProcessFunction) → TopPageResult
+                       +- (9) sink-opensearch-topn → 인덱스 user-activity-topn
 ```
 
-> 1차 대비 2차 변경 요점: ① source가 Avro를 직접 풀던 것을 **raw byte[]** 로 바꾸고 ②`split-deser`에서
+> 1차 대비 2차 변경 요점: (1) source가 Avro를 직접 풀던 것을 **raw byte[]** 로 바꾸고 (2) `split-deser`에서
 > 역직렬화(+DLQ side output)하도록 한 단계 미뤘다(DeserializationSchema는 side output 불가).
 > 그리고 window에 allowedLateness/late side output, 뒤에 Top N + 세 개의 새 sink(dlq/late/topn)가 붙었다.
 
@@ -37,12 +39,14 @@
 
 | 단계 | 입력 타입 | 출력 타입 | 담당 클래스 |
 |---|---|---|---|
-| Source | Kafka 바이트 | `UserActivityEvent` (Avro) | `UserActivityKafkaSourceFactory` |
+| Source | Kafka 레코드 | `byte[]` (원본, 해석 안 함) | `UserActivityKafkaSourceFactory` + `RawBytesDeserializationSchema` |
+| Deser/DLQ | `byte[]` | `UserActivityEvent` (Avro) / 실패 시 `DlqRecord` | `AvroDeserSplitter` |
 | Watermark/Filter | `UserActivityEvent` | `UserActivityEvent` | (Job 내 람다) |
 | Window 집계 | `UserActivityEvent` | `Long` → `PageClickCount` | `PageClickCountAggregator` + `PageClickWindowResultFunction` |
-| 결과 모델 | — | `PageClickCount` | `PageClickCount` |
-| 문서 매핑 | `PageClickCount` | `byte[]` JSON + doc id | `OpenSearchDocs` |
-| Sink | `PageClickCount` | OpenSearch `IndexRequest` | `OpenSearchSinkFactory` |
+| late side output | `UserActivityEvent` | `UserActivityEvent` | window `.sideOutputLateData(LATE_TAG)` |
+| Top N | `PageClickCount` | `TopPageResult` | `TopNPagesFunction` |
+| 문서 매핑 | 각 결과 POJO | `byte[]` JSON + doc id | `OpenSearchDocs` |
+| Sink | 각 결과 POJO | OpenSearch `IndexRequest` | `OpenSearchSinkFactory` |
 
 ---
 
@@ -91,33 +95,39 @@
 
 ## 3. `source/UserActivityKafkaSourceFactory` — Source (`S4`)
 
-**역할**: Kafka 토픽을 **Avro SpecificRecord로 역직렬화**해 읽는 `KafkaSource`를 만든다.
-DAG 라벨 `[source-user-activity-events]`.
+**역할**: Kafka 토픽을 읽는 `KafkaSource`를 만든다. DAG 라벨 `[source-user-activity-events]`.
 
-**핵심 메서드**: `create(bootstrapServers, schemaRegistryUrl, groupId, bounded)`
+> **2차 변경(중요)**: 1차에서는 이 source에 `ConfluentRegistryAvroDeserializationSchema.forSpecific(...)`을
+> 직접 물려 **Avro를 여기서 풀었다**. 2차에서는 DLQ를 위해 source가 `RawBytesDeserializationSchema`로
+> **원본 byte[]만** 읽고, Avro 역직렬화는 side output이 가능한 `AvroDeserSplitter`(11-1)로 한 단계 옮겼다.
+> (`DeserializationSchema`는 side output을 낼 수 없어 역직렬화 실패를 DLQ로 보낼 수 없기 때문 — 가드레일 #9.)
+
+**핵심 메서드**: `create(bootstrapServers, schemaRegistryUrl, groupId, bounded)` → `KafkaSource<byte[]>`
 
 ```java
-KafkaSource.<UserActivityEvent>builder()
+KafkaSource.<byte[]>builder()
     .setBootstrapServers(...)
     .setTopics("user-activity-events")
     .setGroupId(groupId)
     .setStartingOffsets(OffsetsInitializer.earliest())            // 처음부터 읽기
-    .setValueOnlyDeserializer(
-        ConfluentRegistryAvroDeserializationSchema.forSpecific(    // ← 가드레일 #3
-            UserActivityEvent.class, schemaRegistryUrl))
+    .setProperty("commit.offsets.on.checkpoint", "true")          // R1: 오프셋 source of truth = checkpoint(이건 가시성용)
+    .setValueOnlyDeserializer(new RawBytesDeserializationSchema()) // 2차: 해석 안 하고 byte[] 그대로
     // bounded=true 이면:
     .setBounded(OffsetsInitializer.latest())                       // 시작 시점 끝까지만 읽고 종료
 ```
 
 **교과서 포인트**
-- `forSpecific(...)`: 메시지에 박힌 schema id로 Registry에서 *writer 스키마*를 조회해
-  `UserActivityEvent`(reader 스키마)로 디코드. → Avro 스키마 진화의 read 측 핵심.
+- **왜 byte[]로?** Avro 역직렬화는 깨진 메시지(스키마 불일치 등)에 throw한다. source의
+  `DeserializationSchema`에서 풀면 (가) 실패 시 파이프라인이 죽고 (나) side output(DLQ)을 낼 수 없다.
+  그래서 deser를 `AvroDeserSplitter`(ProcessFunction)로 미뤄 try/catch + DLQ side output을 가능케 한다.
+  `forSpecific` 자체는 그대로 쓰되 **위치만 한 단계 뒤로** 옮긴 것(가드레일 #9, #3은 11-1에서 충족).
 - **`bounded` 스위치**가 중요하다.
   - `false`(기본): 무한 스트리밍. 실제 파이프라인 + Web UI 관찰용.
   - `true`: 시작 시점의 latest offset에 도달하면 source가 끝나 **job이 정상 종료** → E2E 검증/배치용.
-- `setStartingOffsets(earliest())`: checkpoint 도입(`R1`) 전이라, 재실행하면 처음부터 다시 읽는다.
-  멱등 sink(아래) 덕분에 다시 읽어도 OpenSearch 문서는 중복되지 않는다.
-- 가드레일: consumer group id 명시. offset은 (향후) Flink checkpoint와 함께 관리하고
+- `setStartingOffsets(earliest())`: 최초 기동 시 토픽을 처음부터 읽는다(bounded 재실행마다 K3 멱등성/E2E
+  반복 검증 가능). 단 checkpoint/savepoint에서 복구할 때는 이 설정과 무관하게 **checkpoint에 스냅샷된
+  offset**에서 재개된다(`R1`).
+- 가드레일: consumer group id 명시. offset은 Flink checkpoint와 함께 관리하고(`R1`)
   Kafka auto-commit에 의존하지 않는다.
 
 > **파티션 ↔ 병렬성**: Kafka 파티션 수(3)가 source subtask 병렬성의 상한이다. source 병렬성이
@@ -143,29 +153,34 @@ StreamExecutionEnvironment env =
 
 **DAG 조립 (operator마다 `.name()` + `.uid()` — 가드레일 #4)**
 
-| # | 코드 | operator name / uid | 의미 |
+| # | 코드(요약) | operator name / uid | 의미 |
 |---|---|---|---|
-| ① | `env.fromSource(source, noWatermarks(), ...)` | `source-user-activity-events` | Kafka+Avro 읽기. **source에는 워터마크 미부여**(다음 단계에서 별도 부여) |
-| ② | `.assignTimestampsAndWatermarks(forBoundedOutOfOrderness(30s).withTimestampAssigner(e->e.getEventTime()))` | `assign-watermark` | Event Time = `eventTime`, 30초 지연 허용 |
-| ③ | `.filter(e -> "CLICK".equals(e.getEventType()))` | `filter-click` | CLICK만 통과 |
-| ④ | `.keyBy(UserActivityEvent::getPageId)` | (키 분배) | 동일 pageId → 동일 task |
-| ⑤ | `.window(TumblingEventTimeWindows.of(5min)).aggregate(agg, windowFn)` | `window-pageclick-5m` | 5분 텀블링 + 집계 → `PageClickCount` |
-| ⑥ | `.sinkTo(OpenSearchSinkFactory.aggSink(...))` | `sink-opensearch-agg` | OpenSearch 적재 |
+| (1) | `env.fromSource(source, noWatermarks(), ...)` | `source-user-activity-events` | Kafka에서 **원본 byte[]** 읽기(워터마크 미부여) |
+| (2) | `.process(new AvroDeserSplitter(registry))` | `split-deser` | Avro 역직렬화(try/catch). 실패분 → `DLQ_TAG` side output → `sink-opensearch-dlq` |
+| (3) | `.assignTimestampsAndWatermarks(forBoundedOutOfOrderness(30s)...withIdleness(...))` | `assign-watermark` | Event Time = `eventTime`, 30초 지연 + idleness |
+| (4) | `.filter(e -> "CLICK".equals(e.getEventType()))` | `filter-click` | CLICK만 통과 |
+| (선택) | `.map(new FaultInjectionMapper(failAfter))` | `fault-injection` | `FAIL_AFTER>0`일 때만 — 복구 데모용 1회 throw |
+| (5) | `.keyBy(UserActivityEvent::getPageId)` | (키 분배) | 동일 pageId → 동일 task |
+| (6) | `.window(Tumbling 5min).allowedLateness(60s).sideOutputLateData(LATE_TAG).aggregate(agg, windowFn)` | `window-pageclick-5m` | 5분 텀블링 집계 → `PageClickCount`. 늦은 이벤트 → `sink-opensearch-late` |
+| (7) | `.sinkTo(OpenSearchSinkFactory.aggSink(...))` | `sink-opensearch-agg` | OpenSearch `user-activity-agg` 적재 |
+| (8) | `.keyBy(PageClickCount::getWindowEnd).process(new TopNPagesFunction(...))` | `topn-pages` | 윈도우별 상위 N → `TopPageResult` |
+| (9) | `.sinkTo(OpenSearchSinkFactory.topnSink(...))` | `sink-opensearch-topn` | OpenSearch `user-activity-topn` 적재 |
 
 마지막에 `env.execute("flink-user-activity-analytics")`로 잡 트리거.
 
 **교과서 포인트**
-- **워터마크를 source가 아니라 ②에서 부여**: 학습 의도로 단계를 분리. `noWatermarks()`로 source를
+- **워터마크를 source가 아니라 (3) `assign-watermark`에서 부여**: 학습 의도로 단계를 분리. `noWatermarks()`로 source를
   통과시킨 뒤 `assign-watermark` operator에서 명시적으로 부여 → DAG에서 watermark 흐름이 또렷이 보임.
 - 모든 operator에 `.uid()` 고정: 향후 checkpoint/savepoint에서 **상태 복원 키**가 되므로 필수.
 - 환경변수로 모든 엔드포인트 override 가능: `BOOTSTRAP_SERVERS`, `SCHEMA_REGISTRY_URL`,
   `KAFKA_GROUP_ID`, `BOUNDED`, `OPENSEARCH_HOST/PORT/SCHEME`, `WEB_UI_PORT`.
+  2차 추가: `TOP_N`, `ALLOWED_LATENESS_MS`, `IDLENESS_MS`, `STATE_TTL_HOURS`, `SINK_DELAY_MS`, `FAIL_AFTER`, `CHECKPOINT_DIR`.
 
 ---
 
 ## 5. 윈도우 집계 한 쌍 — `agg/PageClickCountAggregator` + `agg/PageClickWindowResultFunction`
 
-⑤ `window-pageclick-5m`는 `aggregate(aggregateFunction, processWindowFunction)` **조합**으로 만든다.
+(6) `window-pageclick-5m`은 `aggregate(aggregateFunction, processWindowFunction)` **조합**으로 만든다.
 둘은 역할이 다르고, 함께 쓰면 "증분 집계의 효율"과 "윈도우 메타데이터 접근"을 모두 얻는다 — 전형적 패턴.
 
 ### 5-1. `PageClickCountAggregator` — 증분 카운터 (`AggregateFunction<UserActivityEvent, Long, Long>`)
@@ -201,7 +216,7 @@ public void process(String pageId, Context ctx, Iterable<Long> counts, Collector
 
 ## 6. `model/PageClickCount` — 집계 결과 모델 (POJO)
 
-**역할**: ⑤의 산출물이자 ⑥ 적재의 원본. `pageId, windowStart, windowEnd, count` 4개 필드.
+**역할**: (6) `window-pageclick-5m`의 산출물이자 (7) `sink-opensearch-agg` 적재의 원본. `pageId, windowStart, windowEnd, count` 4개 필드.
 
 **교과서 포인트 — 왜 "POJO 규칙"을 지키나**
 - `public` 무인자 생성자 + private 필드 + 표준 getter/setter. Flink `TypeExtractor`가 이를
@@ -229,7 +244,7 @@ static byte[] aggDocJson(PageClickCount c)
 - OpenSearch는 트랜잭션 sink가 아니다. 그래서 exactly-once에 기대지 않고,
   **같은 윈도우 결과는 항상 같은 문서 ID**로 쓴다. 같은 ID로 다시 쓰면 OpenSearch가 *덮어쓰기(upsert)* →
   장애 재처리/재실행으로 같은 결과가 두 번 와도 **문서가 중복되지 않는다**(`K3` 멱등성).
-- `eventType`은 ③ filter를 거쳐 항상 `CLICK`이므로 ID/필드에 상수로 박는다.
+- `eventType`은 (4) `filter-click`를 거쳐 항상 `CLICK`이므로 ID/필드에 상수로 박는다.
   (전제: pageId에 `_`가 없음 — 현재 데이터의 5종 페이지명은 안전.)
 - 사람이 읽기 좋은 `windowStartIso/windowEndIso`(ISO-8601 UTC) 보조 필드를 함께 넣어 Dashboards에서 보기 편하게.
 - `ObjectMapper`는 thread-safe라 `static`으로 재사용. 직렬화 예외는 sink `emit`이 checked를 못 던지므로
@@ -320,7 +335,7 @@ output을 낼 수 없어 DLQ로 보낼 수도 없다.
 
 ### 11-2. Top N — `topn/TopNPagesFunction` + `model/TopPageResult`
 
-`pageClickCounts`(⑦로 가는 그 스트림)를 `keyBy(windowEnd)`로 다시 키잉해, 같은 윈도우에 속한 페이지별
+`pageClickCounts`((7) `sink-opensearch-agg`로 가는 그 스트림)를 `keyBy(windowEnd)`로 다시 키잉해, 같은 윈도우에 속한 페이지별
 카운트를 한 task로 모은다. `TopNPagesFunction`(`KeyedProcessFunction<Long, PageClickCount, TopPageResult>`):
 
 | 콜백 | 동작 |
